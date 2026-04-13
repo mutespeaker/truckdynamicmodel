@@ -45,7 +45,7 @@ STATE_NAMES = [
     "vy_s",
     "r_s",
 ]
-CONTROL_NAMES = ["steer_sw_rad", "torque_fl", "torque_fr", "torque_rl", "torque_rr"]
+CONTROL_NAMES = ["delta_f_rad", "torque_fl", "torque_fr", "torque_rl", "torque_rr"]
 
 BASE_MODEL_PARAMS = {
     "m_t": 9300.0,
@@ -100,9 +100,9 @@ class ManualSimulationConfig:
     )
 
     # 手动输入恒定控制:
-    # [steer_sw_rad, torque_fl, torque_fr, torque_rl, torque_rr]
+    # [delta_f_rad, torque_fl, torque_fr, torque_rl, torque_rr]
     constant_control: tuple[float, ...] = (
-        3.14,
+        float(np.deg2rad(2.5)),
         0.0,
         0.0,
         180.0,
@@ -182,13 +182,12 @@ class TruckTrailerNominalDynamics(nn.Module):
         vy_s = state[:, 10]
         r_s = state[:, 11]
 
-        steer_sw_rad = control[:, 0]
+        delta_f = control[:, 0]
         torque_fl = control[:, 1]
         torque_fr = control[:, 2]
         torque_rl = control[:, 3]
         torque_rr = control[:, 4]
 
-        delta_f = steer_sw_rad / self.steering_ratio
         b_t = self.L_t - self.a_t
 
         vx_t_safe = self._signed_safe_velocity(vx_t)
@@ -338,7 +337,7 @@ def build_results_dataframe(
         "dt_s": np.full(len(states), float(dt), dtype=np.float32),
         "trailer_mass_kg": np.full(len(states), float(trailer_mass_kg), dtype=np.float32),
         "articulation_deg": articulation_deg.astype(np.float32),
-        "control_steer_sw_deg": np.rad2deg(padded_controls[:, 0]).astype(np.float32),
+        "control_delta_f_deg": np.rad2deg(padded_controls[:, 0]).astype(np.float32),
         "control_torque_fl_nm": padded_controls[:, 1].astype(np.float32),
         "control_torque_fr_nm": padded_controls[:, 2].astype(np.float32),
         "control_torque_rl_nm": padded_controls[:, 3].astype(np.float32),
