@@ -19,15 +19,31 @@ try:
         BASE_MODEL_PARAMS,
         CONTROL_NAMES,
         DEFAULT_TRAILER_MASS_KG,
+        FIXED_DT_S,
+        FORCE_NO_TRAILER_MODE,
+        MLP_OUTPUT_NAMES,
         MLP_NUMPY_DTYPE,
-        MLP_STATE_FEATURE_NAMES,
         MLP_TORCH_DTYPE,
+        MOTION_STATE_NAMES,
         NO_TRAILER_MASS_THRESHOLD_KG,
+        POSE_STATE_NAMES,
         ROAD_WHEEL_DEG_CANDIDATES,
         ROAD_WHEEL_RAD_CANDIDATES,
         RUNS_ROOT,
         STATE_LOSS_WEIGHTS,
         STATE_NAMES,
+        TURNING_FOCUS_FULL_QUANTILE,
+        TURNING_FOCUS_START_QUANTILE,
+        TURNING_FOCUS_STEER_THRESHOLD_DEG,
+        TURNING_GATE_BASE_WEIGHT,
+        TURNING_SAMPLE_WEIGHT_MAX,
+        TURNING_SCORE_ARTICULATION_REF_DEG,
+        TURNING_SCORE_ARTICULATION_WEIGHT,
+        TURNING_SCORE_COMPONENT_CLIP,
+        TURNING_SCORE_LATERAL_SPEED_REF_MPS,
+        TURNING_SCORE_LATERAL_SPEED_WEIGHT,
+        TURNING_SCORE_YAW_RATE_REF_DEGPS,
+        TURNING_SCORE_YAW_RATE_WEIGHT,
         STEERING_RATIO_CANDIDATES,
         STEER_SW_DEG_CANDIDATES,
         STEER_SW_RAD_CANDIDATES,
@@ -56,15 +72,31 @@ except ImportError:
         BASE_MODEL_PARAMS,
         CONTROL_NAMES,
         DEFAULT_TRAILER_MASS_KG,
+        FIXED_DT_S,
+        FORCE_NO_TRAILER_MODE,
+        MLP_OUTPUT_NAMES,
         MLP_NUMPY_DTYPE,
-        MLP_STATE_FEATURE_NAMES,
         MLP_TORCH_DTYPE,
+        MOTION_STATE_NAMES,
         NO_TRAILER_MASS_THRESHOLD_KG,
+        POSE_STATE_NAMES,
         ROAD_WHEEL_DEG_CANDIDATES,
         ROAD_WHEEL_RAD_CANDIDATES,
         RUNS_ROOT,
         STATE_LOSS_WEIGHTS,
         STATE_NAMES,
+        TURNING_FOCUS_FULL_QUANTILE,
+        TURNING_FOCUS_START_QUANTILE,
+        TURNING_FOCUS_STEER_THRESHOLD_DEG,
+        TURNING_GATE_BASE_WEIGHT,
+        TURNING_SAMPLE_WEIGHT_MAX,
+        TURNING_SCORE_ARTICULATION_REF_DEG,
+        TURNING_SCORE_ARTICULATION_WEIGHT,
+        TURNING_SCORE_COMPONENT_CLIP,
+        TURNING_SCORE_LATERAL_SPEED_REF_MPS,
+        TURNING_SCORE_LATERAL_SPEED_WEIGHT,
+        TURNING_SCORE_YAW_RATE_REF_DEGPS,
+        TURNING_SCORE_YAW_RATE_WEIGHT,
         STEERING_RATIO_CANDIDATES,
         STEER_SW_DEG_CANDIDATES,
         STEER_SW_RAD_CANDIDATES,
@@ -128,6 +160,207 @@ def compute_articulation_series(states: np.ndarray) -> np.ndarray:
     return np.rad2deg(wrap_angle_error_np(states[:, 8] - states[:, 2]))
 
 
+def smoothstep01_np(values: np.ndarray) -> np.ndarray:
+    clipped = np.clip(values.astype(np.float32), 0.0, 1.0)
+    return (clipped * clipped * (3.0 - 2.0 * clipped)).astype(np.float32)
+
+
+def compute_turning_focus_score(states: np.ndarray, controls: np.ndarray) -> np.ndarray:
+    steer_sw_deg = np.abs(np.rad2deg(controls[:, 0])).astype(np.float32)
+    gate_mask = steer_sw_deg > float(TURNING_FOCUS_STEER_THRESHOLD_DEG)
+
+    yaw_rate_degps = np.maximum(
+        np.abs(np.rad2deg(states[:, 5])).astype(np.float32),
+        np.abs(np.rad2deg(states[:, 11])).astype(np.float32),
+    )
+    lateral_speed_mps = np.maximum(np.abs(states[:, 4]).astype(np.float32), np.abs(states[:, 10]).astype(np.float32))
+    articulation_deg = np.abs(compute_articulation_series(states)).astype(np.float32)
+
+    yaw_rate_component = TURNING_SCORE_YAW_RATE_WEIGHT * np.clip(
+        yaw_rate_degps / TURNING_SCORE_YAW_RATE_REF_DEGPS,
+        0.0,
+        TURNING_SCORE_COMPONENT_CLIP,
+    )
+    lateral_speed_component = TURNING_SCORE_LATERAL_SPEED_WEIGHT * np.clip(
+        lateral_speed_mps / TURNING_SCORE_LATERAL_SPEED_REF_MPS,
+        0.0,
+        TURNING_SCORE_COMPONENT_CLIP,
+    )
+    articulation_component = TURNING_SCORE_ARTICULATION_WEIGHT * np.clip(
+        articulation_deg / TURNING_SCORE_ARTICULATION_REF_DEG,
+        0.0,
+        TURNING_SCORE_COMPONENT_CLIP,
+    )
+    severity_score = np.maximum.reduce(
+        [
+            yaw_rate_component.astype(np.float32),
+            lateral_speed_component.astype(np.float32),
+            articulation_component.astype(np.float32),
+        ]
+    ).astype(np.float32)
+
+    turn_scores = np.full_like(steer_sw_deg, -1.0, dtype=np.float32)
+    turn_scores[gate_mask] = severity_score[gate_mask]
+    return turn_scores
+
+
+def fit_turning_focus_context(turn_scores: np.ndarray) -> dict[str, float]:
+    scores = np.asarray(turn_scores, dtype=np.float32).reshape(-1)
+    gated_scores = scores[scores >= 0.0]
+    if gated_scores.size == 0:
+        return {
+            "threshold_deg": float(TURNING_FOCUS_STEER_THRESHOLD_DEG),
+            "gate_base_weight": float(TURNING_GATE_BASE_WEIGHT),
+            "start_quantile": float(TURNING_FOCUS_START_QUANTILE),
+            "full_quantile": float(TURNING_FOCUS_FULL_QUANTILE),
+            "score_start": 0.0,
+            "score_full": 1.0,
+            "sample_weight_max": float(TURNING_SAMPLE_WEIGHT_MAX),
+        }
+    if scores.size == 0:
+        return {
+            "threshold_deg": float(TURNING_FOCUS_STEER_THRESHOLD_DEG),
+            "gate_base_weight": float(TURNING_GATE_BASE_WEIGHT),
+            "start_quantile": float(TURNING_FOCUS_START_QUANTILE),
+            "full_quantile": float(TURNING_FOCUS_FULL_QUANTILE),
+            "score_start": 0.0,
+            "score_full": 1.0,
+            "sample_weight_max": float(TURNING_SAMPLE_WEIGHT_MAX),
+        }
+
+    score_start = float(np.quantile(gated_scores, TURNING_FOCUS_START_QUANTILE))
+    score_full = float(np.quantile(gated_scores, TURNING_FOCUS_FULL_QUANTILE))
+    if not np.isfinite(score_start):
+        score_start = 0.0
+    if not np.isfinite(score_full):
+        score_full = score_start + 1.0
+    if score_full <= score_start + 1.0e-6:
+        score_full = score_start + 1.0e-3
+
+    return {
+        "threshold_deg": float(TURNING_FOCUS_STEER_THRESHOLD_DEG),
+        "gate_base_weight": float(TURNING_GATE_BASE_WEIGHT),
+        "start_quantile": float(TURNING_FOCUS_START_QUANTILE),
+        "full_quantile": float(TURNING_FOCUS_FULL_QUANTILE),
+        "score_start": score_start,
+        "score_full": score_full,
+        "sample_weight_max": float(TURNING_SAMPLE_WEIGHT_MAX),
+    }
+
+
+def compute_turning_focus_mask(turn_scores: np.ndarray, turning_focus_context: dict[str, float]) -> np.ndarray:
+    _ = turning_focus_context
+    scores = np.asarray(turn_scores, dtype=np.float32).reshape(-1)
+    return (scores >= 0.0).astype(np.float32)
+
+
+def compute_turning_sample_weights(turn_scores: np.ndarray, turning_focus_context: dict[str, float]) -> np.ndarray:
+    scores = np.asarray(turn_scores, dtype=np.float32).reshape(-1)
+    gate_mask = scores >= 0.0
+    score_start = float(turning_focus_context["score_start"])
+    score_full = float(turning_focus_context["score_full"])
+    gate_base_weight = float(turning_focus_context["gate_base_weight"])
+    sample_weight_max = float(turning_focus_context["sample_weight_max"])
+    weights = np.ones_like(scores, dtype=np.float32)
+    if np.any(gate_mask):
+        normalized = (scores[gate_mask] - score_start) / max(score_full - score_start, 1.0e-6)
+        focus_strength = smoothstep01_np(normalized)
+        weights[gate_mask] = gate_base_weight + (sample_weight_max - gate_base_weight) * focus_strength
+    return weights.astype(np.float32)
+
+
+def describe_turning_focus_context(
+    turning_focus_context: dict[str, float],
+    train_turn_scores: np.ndarray,
+    train_sample_weights: np.ndarray,
+    val_turn_scores: np.ndarray | None = None,
+    val_sample_weights: np.ndarray | None = None,
+) -> None:
+    print("Turning-focus weighting:")
+    print(
+        "  thresholds | "
+        f"steer_gate={turning_focus_context['threshold_deg']:.1f} deg "
+        f"start_q={turning_focus_context['start_quantile']:.2f} "
+        f"full_q={turning_focus_context['full_quantile']:.2f} "
+        f"base_w={turning_focus_context['gate_base_weight']:.2f} "
+        f"max_w={turning_focus_context['sample_weight_max']:.2f}"
+    )
+
+    def _print_split(name: str, scores: np.ndarray, weights: np.ndarray) -> None:
+        scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+        weights = np.asarray(weights, dtype=np.float32).reshape(-1)
+        if scores.size == 0:
+            print(f"  {name:<5} | no samples")
+            return
+        turn_mask = compute_turning_focus_mask(scores, turning_focus_context) > 0.5
+        gated_scores = scores[turn_mask] if np.any(turn_mask) else np.array([], dtype=np.float32)
+        boosted_ratio = float(np.mean(weights > 1.0 + 1.0e-3))
+        strong_ratio = float(np.mean(weights > 2.0))
+        turn_ratio = float(np.mean(turn_mask))
+        if gated_scores.size > 0:
+            q50, q90, q95 = np.quantile(gated_scores, [0.50, 0.90, 0.95]).astype(np.float32)
+            score_text = f"sev_q50={q50:.4f} sev_q90={q90:.4f} sev_q95={q95:.4f}"
+        else:
+            score_text = "sev_q50=NA sev_q90=NA sev_q95=NA"
+        print(
+            f"  {name:<5} | {score_text} "
+            f"| mean_w={float(np.mean(weights)):.3f} max_w={float(np.max(weights)):.3f} "
+            f"| steer>5deg={turn_ratio:.1%} boosted={boosted_ratio:.1%} strong={strong_ratio:.1%}"
+        )
+
+    _print_split("train", train_turn_scores, train_sample_weights)
+    if val_turn_scores is not None and val_sample_weights is not None:
+        _print_split("val", val_turn_scores, val_sample_weights)
+
+
+def compute_relative_pose_np(states: np.ndarray) -> np.ndarray:
+    dx = states[:, 6:7] - states[:, 0:1]
+    dy = states[:, 7:8] - states[:, 1:2]
+    psi_t = states[:, 2:3]
+    cos_t = np.cos(psi_t).astype(np.float32)
+    sin_t = np.sin(psi_t).astype(np.float32)
+    rel_x = cos_t * dx + sin_t * dy
+    rel_y = -sin_t * dx + cos_t * dy
+    rel_yaw = wrap_angle_error_np((states[:, 8:9] - states[:, 2:3]).reshape(-1)).reshape(-1, 1)
+    return np.concatenate([rel_x, rel_y, rel_yaw], axis=1).astype(np.float32)
+
+
+def relative_pose_to_absolute_np(tractor_pose: np.ndarray, relative_pose: np.ndarray) -> np.ndarray:
+    psi_t = tractor_pose[:, 2:3]
+    cos_t = np.cos(psi_t).astype(np.float32)
+    sin_t = np.sin(psi_t).astype(np.float32)
+    rel_x = relative_pose[:, 0:1].astype(np.float32)
+    rel_y = relative_pose[:, 1:2].astype(np.float32)
+    x_s = tractor_pose[:, 0:1] + cos_t * rel_x - sin_t * rel_y
+    y_s = tractor_pose[:, 1:2] + sin_t * rel_x + cos_t * rel_y
+    psi_s = wrap_angle_error_np((tractor_pose[:, 2:3] + relative_pose[:, 2:3]).reshape(-1)).reshape(-1, 1)
+    return np.concatenate([x_s, y_s, psi_s], axis=1).astype(np.float32)
+
+
+def compute_relative_pose_torch(states: torch.Tensor) -> torch.Tensor:
+    dx = states[:, 6:7] - states[:, 0:1]
+    dy = states[:, 7:8] - states[:, 1:2]
+    psi_t = states[:, 2:3]
+    cos_t = torch.cos(psi_t)
+    sin_t = torch.sin(psi_t)
+    rel_x = cos_t * dx + sin_t * dy
+    rel_y = -sin_t * dx + cos_t * dy
+    rel_yaw = wrap_angle_error_torch(states[:, 8:9] - states[:, 2:3])
+    return torch.cat([rel_x, rel_y, rel_yaw], dim=1)
+
+
+def relative_pose_to_absolute_torch(tractor_pose: torch.Tensor, relative_pose: torch.Tensor) -> torch.Tensor:
+    psi_t = tractor_pose[:, 2:3]
+    cos_t = torch.cos(psi_t)
+    sin_t = torch.sin(psi_t)
+    rel_x = relative_pose[:, 0:1]
+    rel_y = relative_pose[:, 1:2]
+    x_s = tractor_pose[:, 0:1] + cos_t * rel_x - sin_t * rel_y
+    y_s = tractor_pose[:, 1:2] + sin_t * rel_x + cos_t * rel_y
+    psi_s = wrap_angle_error_torch(tractor_pose[:, 2:3] + relative_pose[:, 2:3])
+    return torch.cat([x_s, y_s, psi_s], dim=1)
+
+
 def find_first_existing_column(frame: pd.DataFrame, candidates: list[str]) -> str | None:
     for candidate in candidates:
         if candidate in frame.columns:
@@ -180,6 +413,17 @@ def find_all_real_data_csvs_under(root_dir: Path) -> list[Path]:
     )
 
 
+def find_all_train_segment_csvs_under(root_dir: Path) -> list[Path]:
+    root_dir = Path(root_dir)
+    if not root_dir.exists():
+        raise FileNotFoundError(f"root_dir does not exist: {root_dir}")
+    return sorted(
+        root_dir.rglob("*_train_segment_*.csv"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
 def resolve_control_and_trajectory_csv(input_path: Path) -> Path:
     input_path = Path(input_path)
     if not input_path.exists():
@@ -209,6 +453,9 @@ def collect_control_and_trajectory_csvs(
         return find_all_real_data_csvs(runs_root)
     input_path = Path(input_path)
     if input_path.is_dir():
+        train_segment_csvs = find_all_train_segment_csvs_under(input_path)
+        if train_segment_csvs:
+            return train_segment_csvs
         nested_csvs = find_all_real_data_csvs_under(input_path)
         if nested_csvs:
             return nested_csvs
@@ -222,6 +469,9 @@ def resolve_plot_dir_for_segment(csv_path: Path) -> Path:
 
 
 def resolve_steering_wheel_angle_rad(frame: pd.DataFrame, csv_path: Path) -> np.ndarray:
+    # Steering input must come from a steering-wheel-angle column. In the current
+    # train_segment data this is `Steer_deg_cmd`; do not fall back to
+    # `Target_Steer_L1_deg_cmd`, which is a front-wheel target angle.
     sw_rad_col = find_first_existing_column(frame, STEER_SW_RAD_CANDIDATES)
     if sw_rad_col is not None:
         sw_rad = frame[sw_rad_col].to_numpy(dtype=np.float32)
@@ -311,10 +561,9 @@ def load_truck_trailer_data_as_segment(csv_path: Path) -> SegmentData:
     if len(time) < 2:
         raise ValueError(f"CSV must contain at least two rows: {csv_path}")
 
-    dt_values = np.diff(time)
-    positive_dt = dt_values[dt_values > 0.0]
-    nominal_dt = float(np.median(positive_dt)) if positive_dt.size else 0.02
-    dt_values = np.where(dt_values > 0.0, dt_values, nominal_dt).astype(np.float32)
+    # The current data pipeline assumes a fixed 50 Hz rate. Use fixed dt in the
+    # base model and residual post-processing, but keep dt out of the MLP input.
+    dt_values = np.full(len(time) - 1, FIXED_DT_S, dtype=np.float32)
 
     steer_sw_rad = resolve_steering_wheel_angle_rad(dataframe, csv_path)
     torque_fl = read_column_as_float(dataframe, TORQUE_FL_CANDIDATES, "torque_fl", csv_path)
@@ -340,7 +589,16 @@ def load_truck_trailer_data_as_segment(csv_path: Path) -> SegmentData:
         value is not None
         for value in (trailer_x, trailer_y, trailer_yaw_deg, trailer_vx, trailer_vy, trailer_r_degps)
     )
-    if trailer_fields_complete:
+    if FORCE_NO_TRAILER_MODE:
+        print(f"[Info] FORCE_NO_TRAILER_MODE is enabled. Using tractor states as trailer placeholders for {csv_path}.")
+        trailer_x = tractor_x.copy()
+        trailer_y = tractor_y.copy()
+        trailer_yaw_deg = tractor_yaw_deg.copy()
+        trailer_vx = tractor_vx.copy()
+        trailer_vy = tractor_vy.copy()
+        trailer_r_degps = tractor_r_degps.copy()
+        trailer_mass_kg = np.zeros(len(dataframe), dtype=np.float32)
+    elif trailer_fields_complete:
         trailer_mass_kg = resolve_trailer_mass_signal(dataframe, csv_path)
     else:
         print(f"[Info] Trailer states are incomplete in {csv_path}. Falling back to no-trailer mode.")
@@ -389,25 +647,32 @@ def load_truck_trailer_data_as_segment(csv_path: Path) -> SegmentData:
 
 
 def build_mlp_state_features_np(states: np.ndarray, trailer_mass_kg: np.ndarray) -> np.ndarray:
-    articulation = wrap_angle_error_np(states[:, 8] - states[:, 2])
-    speed_t = np.sqrt(states[:, 3] ** 2 + states[:, 4] ** 2).astype(np.float32)
-    speed_s = np.sqrt(states[:, 9] ** 2 + states[:, 10] ** 2).astype(np.float32)
+    # Use translation-invariant state. Absolute x/y never enters the MLP; when a
+    # trailer is present its pose is represented relative to the tractor frame.
+    trailer_mass_kg = trailer_mass_kg.reshape(-1).astype(np.float32)
+    has_trailer = (trailer_mass_kg > NO_TRAILER_MASS_THRESHOLD_KG).astype(np.float32)
+    relative_pose = compute_relative_pose_np(states)
     return np.column_stack(
         [
-            trailer_mass_kg.astype(np.float32),
+            trailer_mass_kg,
+            has_trailer,
             states[:, 3],
             states[:, 4],
             states[:, 5],
-            speed_t,
             states[:, 9],
             states[:, 10],
             states[:, 11],
-            speed_s,
-            articulation,
-            np.sin(articulation).astype(np.float32),
-            np.cos(articulation).astype(np.float32),
+            relative_pose[:, 0],
+            relative_pose[:, 1],
+            np.sin(relative_pose[:, 2]).astype(np.float32),
+            np.cos(relative_pose[:, 2]).astype(np.float32),
         ]
     ).astype(np.float32)
+
+
+def build_mlp_control_features_np(controls: np.ndarray) -> np.ndarray:
+    rear_drive_torque_sum = controls[:, 3] + controls[:, 4]
+    return np.column_stack([controls[:, 0], rear_drive_torque_sum]).astype(np.float32)
 
 
 def build_mlp_input_feature_tensor(
@@ -418,28 +683,28 @@ def build_mlp_input_feature_tensor(
 ) -> torch.Tensor:
     if trailer_mass_kg.ndim == 1:
         trailer_mass_kg = trailer_mass_kg.unsqueeze(1)
-    if dt.ndim == 1:
-        dt = dt.unsqueeze(1)
+    # dt is fixed at FIXED_DT_S and is therefore used outside the MLP only.
+    _ = dt
 
-    articulation = wrap_angle_error_torch(state[:, 8:9] - state[:, 2:3])
-    speed_t = torch.sqrt(state[:, 3:4] * state[:, 3:4] + state[:, 4:5] * state[:, 4:5] + 1.0e-8)
-    speed_s = torch.sqrt(state[:, 9:10] * state[:, 9:10] + state[:, 10:11] * state[:, 10:11] + 1.0e-8)
+    has_trailer = (trailer_mass_kg > NO_TRAILER_MASS_THRESHOLD_KG).to(dtype=MLP_TORCH_DTYPE)
+    relative_pose = compute_relative_pose_torch(state)
+    rear_drive_torque_sum = control[:, 3:4] + control[:, 4:5]
     return torch.cat(
         [
             trailer_mass_kg.to(dtype=MLP_TORCH_DTYPE),
+            has_trailer,
             state[:, 3:4].to(dtype=MLP_TORCH_DTYPE),
             state[:, 4:5].to(dtype=MLP_TORCH_DTYPE),
             state[:, 5:6].to(dtype=MLP_TORCH_DTYPE),
-            speed_t.to(dtype=MLP_TORCH_DTYPE),
             state[:, 9:10].to(dtype=MLP_TORCH_DTYPE),
             state[:, 10:11].to(dtype=MLP_TORCH_DTYPE),
             state[:, 11:12].to(dtype=MLP_TORCH_DTYPE),
-            speed_s.to(dtype=MLP_TORCH_DTYPE),
-            articulation.to(dtype=MLP_TORCH_DTYPE),
-            torch.sin(articulation).to(dtype=MLP_TORCH_DTYPE),
-            torch.cos(articulation).to(dtype=MLP_TORCH_DTYPE),
-            control.to(dtype=MLP_TORCH_DTYPE),
-            dt.to(dtype=MLP_TORCH_DTYPE),
+            relative_pose[:, 0:1].to(dtype=MLP_TORCH_DTYPE),
+            relative_pose[:, 1:2].to(dtype=MLP_TORCH_DTYPE),
+            torch.sin(relative_pose[:, 2:3]).to(dtype=MLP_TORCH_DTYPE),
+            torch.cos(relative_pose[:, 2:3]).to(dtype=MLP_TORCH_DTYPE),
+            control[:, 0:1].to(dtype=MLP_TORCH_DTYPE),
+            rear_drive_torque_sum.to(dtype=MLP_TORCH_DTYPE),
         ],
         dim=1,
     )
@@ -452,10 +717,11 @@ def build_training_features(
     dt_values: np.ndarray,
 ) -> np.ndarray:
     state_features = build_mlp_state_features_np(states, trailer_mass_kg)
-    return np.concatenate(
-        [state_features, controls.astype(np.float32), dt_values.reshape(-1, 1).astype(np.float32)],
-        axis=1,
-    ).astype(np.float32)
+    control_features = build_mlp_control_features_np(controls)
+    # dt_values stays in the function signature to make the training data path
+    # explicit, but the fixed 0.02 s step is not part of the MLP feature vector.
+    _ = dt_values
+    return np.concatenate([state_features, control_features], axis=1).astype(np.float32)
 
 
 def build_feature_context(features: np.ndarray) -> dict[str, np.ndarray]:
@@ -482,66 +748,109 @@ def normalize_feature_tensor(features: torch.Tensor, feature_context_tensors: di
     return (features - feature_context_tensors["feature_mean"]) / feature_context_tensors["feature_scale"]
 
 
-def derive_full_error_from_motion_error_np(
-    motion_error: np.ndarray,
+def derive_full_error_from_mlp_output_np(
+    mlp_output: np.ndarray,
     base_next: np.ndarray,
     dt_values: np.ndarray,
+    trailer_mass_kg: np.ndarray,
 ) -> np.ndarray:
+    if mlp_output.shape[1] != len(MLP_OUTPUT_NAMES):
+        raise ValueError(
+            f"mlp_output has {mlp_output.shape[1]} columns, expected {len(MLP_OUTPUT_NAMES)}: {MLP_OUTPUT_NAMES}"
+        )
     safe_dt = np.clip(dt_values.reshape(-1, 1).astype(np.float32), 1.0e-6, None)
+    has_trailer = (trailer_mass_kg.reshape(-1, 1).astype(np.float32) > NO_TRAILER_MASS_THRESHOLD_KG).astype(np.float32)
     yaw_t = base_next[:, 2:3].astype(np.float32)
-    yaw_s = base_next[:, 8:9].astype(np.float32)
 
-    evx_t = motion_error[:, 0:1].astype(np.float32)
-    evy_t = motion_error[:, 1:2].astype(np.float32)
-    er_t = motion_error[:, 2:3].astype(np.float32)
-    evx_s = motion_error[:, 3:4].astype(np.float32)
-    evy_s = motion_error[:, 4:5].astype(np.float32)
-    er_s = motion_error[:, 5:6].astype(np.float32)
+    evx_t = mlp_output[:, 0:1].astype(np.float32)
+    evy_t = mlp_output[:, 1:2].astype(np.float32)
+    er_t = mlp_output[:, 2:3].astype(np.float32)
+    evx_s = mlp_output[:, 3:4].astype(np.float32)
+    evy_s = mlp_output[:, 4:5].astype(np.float32)
+    er_s = mlp_output[:, 5:6].astype(np.float32)
 
     dx_t = (np.cos(yaw_t) * evx_t - np.sin(yaw_t) * evy_t) * safe_dt
     dy_t = (np.sin(yaw_t) * evx_t + np.cos(yaw_t) * evy_t) * safe_dt
     dpsi_t = wrap_angle_error_np((er_t * safe_dt).reshape(-1)).reshape(-1, 1)
 
-    dx_s = (np.cos(yaw_s) * evx_s - np.sin(yaw_s) * evy_s) * safe_dt
-    dy_s = (np.sin(yaw_s) * evx_s + np.cos(yaw_s) * evy_s) * safe_dt
-    dpsi_s = wrap_angle_error_np((er_s * safe_dt).reshape(-1)).reshape(-1, 1)
+    tractor_pose_corrected = base_next[:, 0:3].astype(np.float32) + np.concatenate([dx_t, dy_t, dpsi_t], axis=1)
+    tractor_pose_corrected[:, 2] = wrap_angle_error_np(tractor_pose_corrected[:, 2])
+
+    base_relative_pose = compute_relative_pose_np(base_next)
+    rel_delta = mlp_output[:, 6:9].astype(np.float32)
+    corrected_relative_pose = base_relative_pose + rel_delta
+    corrected_relative_pose[:, 2] = wrap_angle_error_np(corrected_relative_pose[:, 2])
+    trailer_pose_corrected = relative_pose_to_absolute_np(tractor_pose_corrected, corrected_relative_pose)
+    trailer_pose_error = trailer_pose_corrected - base_next[:, 6:9].astype(np.float32)
+    trailer_pose_error[:, 2] = wrap_angle_error_np(trailer_pose_error[:, 2])
+
+    no_trailer_pose_error = np.concatenate([dx_t, dy_t, dpsi_t], axis=1)
+    trailer_pose_error = has_trailer * trailer_pose_error + (1.0 - has_trailer) * no_trailer_pose_error
+    trailer_motion_error = has_trailer * np.concatenate([evx_s, evy_s, er_s], axis=1) + (1.0 - has_trailer) * np.concatenate(
+        [evx_t, evy_t, er_t],
+        axis=1,
+    )
 
     return np.concatenate(
-        [dx_t, dy_t, dpsi_t, evx_t, evy_t, er_t, dx_s, dy_s, dpsi_s, evx_s, evy_s, er_s],
+        [dx_t, dy_t, dpsi_t, evx_t, evy_t, er_t, trailer_pose_error, trailer_motion_error],
         axis=1,
     ).astype(np.float32)
 
 
-def derive_full_error_from_motion_error_torch(
-    motion_error: torch.Tensor,
+def derive_full_error_from_mlp_output_torch(
+    mlp_output: torch.Tensor,
     base_next: torch.Tensor,
     dt_values: torch.Tensor,
+    trailer_mass_kg: torch.Tensor,
 ) -> torch.Tensor:
+    if mlp_output.shape[1] != len(MLP_OUTPUT_NAMES):
+        raise ValueError(
+            f"mlp_output has {mlp_output.shape[1]} columns, expected {len(MLP_OUTPUT_NAMES)}: {MLP_OUTPUT_NAMES}"
+        )
     if dt_values.ndim == 1:
         dt_values = dt_values.unsqueeze(1)
+    if trailer_mass_kg.ndim == 1:
+        trailer_mass_kg = trailer_mass_kg.unsqueeze(1)
     safe_dt = torch.clamp(dt_values, min=1.0e-6)
+    has_trailer = (trailer_mass_kg > NO_TRAILER_MASS_THRESHOLD_KG).to(dtype=mlp_output.dtype, device=mlp_output.device)
     yaw_t = base_next[:, 2:3]
-    yaw_s = base_next[:, 8:9]
 
-    evx_t = motion_error[:, 0:1]
-    evy_t = motion_error[:, 1:2]
-    er_t = motion_error[:, 2:3]
-    evx_s = motion_error[:, 3:4]
-    evy_s = motion_error[:, 4:5]
-    er_s = motion_error[:, 5:6]
+    evx_t = mlp_output[:, 0:1]
+    evy_t = mlp_output[:, 1:2]
+    er_t = mlp_output[:, 2:3]
+    evx_s = mlp_output[:, 3:4]
+    evy_s = mlp_output[:, 4:5]
+    er_s = mlp_output[:, 5:6]
 
     dx_t = (torch.cos(yaw_t) * evx_t - torch.sin(yaw_t) * evy_t) * safe_dt
     dy_t = (torch.sin(yaw_t) * evx_t + torch.cos(yaw_t) * evy_t) * safe_dt
     dpsi_t = wrap_angle_error_torch(er_t * safe_dt)
 
-    dx_s = (torch.cos(yaw_s) * evx_s - torch.sin(yaw_s) * evy_s) * safe_dt
-    dy_s = (torch.sin(yaw_s) * evx_s + torch.cos(yaw_s) * evy_s) * safe_dt
-    dpsi_s = wrap_angle_error_torch(er_s * safe_dt)
+    tractor_pose_corrected = base_next[:, 0:3] + torch.cat([dx_t, dy_t, dpsi_t], dim=1)
+    tractor_pose_corrected = tractor_pose_corrected.clone()
+    tractor_pose_corrected[:, 2:3] = wrap_angle_error_torch(tractor_pose_corrected[:, 2:3])
 
-    return torch.cat([dx_t, dy_t, dpsi_t, evx_t, evy_t, er_t, dx_s, dy_s, dpsi_s, evx_s, evy_s, er_s], dim=1)
+    base_relative_pose = compute_relative_pose_torch(base_next)
+    rel_delta = mlp_output[:, 6:9]
+    corrected_relative_pose = base_relative_pose + rel_delta
+    corrected_relative_pose = corrected_relative_pose.clone()
+    corrected_relative_pose[:, 2:3] = wrap_angle_error_torch(corrected_relative_pose[:, 2:3])
+    trailer_pose_corrected = relative_pose_to_absolute_torch(tractor_pose_corrected, corrected_relative_pose)
+    trailer_pose_error = trailer_pose_corrected - base_next[:, 6:9]
+    trailer_pose_error = trailer_pose_error.clone()
+    trailer_pose_error[:, 2:3] = wrap_angle_error_torch(trailer_pose_error[:, 2:3])
+
+    no_trailer_pose_error = torch.cat([dx_t, dy_t, dpsi_t], dim=1)
+    trailer_pose_error = has_trailer * trailer_pose_error + (1.0 - has_trailer) * no_trailer_pose_error
+    trailer_motion_error = has_trailer * torch.cat([evx_s, evy_s, er_s], dim=1) + (1.0 - has_trailer) * torch.cat(
+        [evx_t, evy_t, er_t],
+        dim=1,
+    )
+
+    return torch.cat([dx_t, dy_t, dpsi_t, evx_t, evy_t, er_t, trailer_pose_error, trailer_motion_error], dim=1)
 
 
-def build_loss_context(true_error: np.ndarray, device: torch.device) -> dict[str, torch.Tensor]:
+def build_loss_context(true_error: np.ndarray, true_mlp_output: np.ndarray, device: torch.device) -> dict[str, torch.Tensor]:
     error_std = np.std(true_error, axis=0).astype(np.float32)
     min_scale = np.array(
         [
@@ -561,22 +870,46 @@ def build_loss_context(true_error: np.ndarray, device: torch.device) -> dict[str
         dtype=np.float32,
     )
     error_scale = np.maximum(error_std, min_scale).astype(np.float32)
-    pose_error_scale = np.concatenate([error_scale[:3], error_scale[6:9]], axis=0).astype(np.float32)
-    motion_error_scale = np.concatenate([error_scale[3:6], error_scale[9:12]], axis=0).astype(np.float32)
+    pose_indices = [STATE_NAMES.index(name) for name in POSE_STATE_NAMES]
+    motion_indices = [STATE_NAMES.index(name) for name in MOTION_STATE_NAMES]
+    pose_error_scale = error_scale[pose_indices].astype(np.float32)
+    motion_error_scale = error_scale[motion_indices].astype(np.float32)
+    output_min_scale = np.array(
+        [
+            0.001,
+            0.001,
+            np.deg2rad(0.01),
+            0.001,
+            0.001,
+            np.deg2rad(0.01),
+            0.001,
+            0.001,
+            np.deg2rad(0.01),
+        ],
+        dtype=np.float32,
+    )
+    output_scale = np.maximum(np.std(true_mlp_output, axis=0).astype(np.float32), output_min_scale).astype(np.float32)
     channel_weight = np.array([STATE_LOSS_WEIGHTS[name] for name in STATE_NAMES], dtype=np.float32)
+    output_weight = np.array([1.0, 1.0, 5.0, 1.0, 1.0, 5.0, 1.0, 1.0, 2.0], dtype=np.float32)
     return {
         "error_scale": to_mlp_tensor(error_scale.reshape(1, -1), device),
         "pose_error_scale": to_mlp_tensor(pose_error_scale.reshape(1, -1), device),
         "motion_error_scale": to_mlp_tensor(motion_error_scale.reshape(1, -1), device),
+        "output_scale": to_mlp_tensor(output_scale.reshape(1, -1), device),
         "channel_weight": to_mlp_tensor(channel_weight.reshape(1, -1), device),
+        "output_weight": to_mlp_tensor(output_weight.reshape(1, -1), device),
     }
 
 
 def describe_loss_context(loss_context: dict[str, torch.Tensor]) -> None:
     error_scale = loss_context["error_scale"].detach().cpu().numpy().ravel()
+    output_scale = loss_context["output_scale"].detach().cpu().numpy().ravel()
     print("Per-state error scale:")
     for index, name in enumerate(STATE_NAMES):
         print(f"  {name:<6} weight={STATE_LOSS_WEIGHTS[name]:.3f} error_scale={error_scale[index]:.6f}")
+    print("Per-MLP-output scale:")
+    for index, name in enumerate(MLP_OUTPUT_NAMES):
+        print(f"  {name:<12} error_scale={output_scale[index]:.6f}")
 
 
 @torch.no_grad()
@@ -659,10 +992,14 @@ def concat_segments_for_training(
     base_model: TruckTrailerNominalDynamics,
     segments: list[SegmentData],
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     all_features: list[np.ndarray] = []
+    all_true_mlp_output: list[np.ndarray] = []
     all_true_error: list[np.ndarray] = []
     all_base_next: list[np.ndarray] = []
+    all_dt_values: list[np.ndarray] = []
+    all_trailer_mass_kg: list[np.ndarray] = []
+    all_turn_scores: list[np.ndarray] = []
 
     for seg in segments:
         features = build_training_features(seg.states, seg.controls, seg.trailer_mass_kg, seg.dt_values)
@@ -674,6 +1011,7 @@ def concat_segments_for_training(
             dt_values=seg.dt_values,
             device=device,
         )
+        has_trailer = (seg.trailer_mass_kg.reshape(-1, 1) > NO_TRAILER_MASS_THRESHOLD_KG).astype(np.float32)
         true_motion_error = np.concatenate(
             [
                 seg.next_states[:, 3:6] - base_next[:, 3:6],
@@ -681,14 +1019,33 @@ def concat_segments_for_training(
             ],
             axis=1,
         ).astype(np.float32)
-        true_error = derive_full_error_from_motion_error_np(true_motion_error, base_next, seg.dt_values)
+        true_motion_error[:, 3:6] = has_trailer * true_motion_error[:, 3:6]
+
+        true_relative_pose = compute_relative_pose_np(seg.next_states)
+        base_relative_pose = compute_relative_pose_np(base_next)
+        true_relative_error = true_relative_pose - base_relative_pose
+        true_relative_error[:, 2] = wrap_angle_error_np(true_relative_error[:, 2])
+        true_relative_error = (has_trailer * true_relative_error).astype(np.float32)
+        true_mlp_output = np.concatenate([true_motion_error, true_relative_error], axis=1).astype(np.float32)
+
+        true_error = (seg.next_states - base_next).astype(np.float32)
+        true_error[:, 2] = wrap_angle_error_np(true_error[:, 2])
+        true_error[:, 8] = wrap_angle_error_np(true_error[:, 8])
 
         all_features.append(features)
+        all_true_mlp_output.append(true_mlp_output)
         all_true_error.append(true_error)
         all_base_next.append(base_next)
+        all_dt_values.append(seg.dt_values.reshape(-1, 1).astype(np.float32))
+        all_trailer_mass_kg.append(seg.trailer_mass_kg.reshape(-1, 1).astype(np.float32))
+        all_turn_scores.append(compute_turning_focus_score(seg.states, seg.controls).astype(np.float32))
 
     return (
         np.concatenate(all_features, axis=0),
+        np.concatenate(all_true_mlp_output, axis=0),
         np.concatenate(all_true_error, axis=0),
         np.concatenate(all_base_next, axis=0),
+        np.concatenate(all_dt_values, axis=0),
+        np.concatenate(all_trailer_mass_kg, axis=0),
+        np.concatenate(all_turn_scores, axis=0),
     )

@@ -21,9 +21,14 @@ try:
     from .constants import (
         BASE_MODEL_PARAMS,
         MODEL_CHECKPOINT,
+        MLP_DROPOUT_P,
+        MLP_HIDDEN_DIM,
+        MLP_HIDDEN_LAYERS,
+        MLP_INPUT_FEATURE_NAMES,
+        MLP_OUTPUT_NAMES,
         MLP_NUMPY_DTYPE,
         MLP_TORCH_DTYPE,
-        MOTION_ERROR_NAMES,
+        REAL_DATA_LABEL,
         RUNS_ROOT,
         STATE_NAMES,
         TRAIN_LOSS_MODEL_CHECKPOINT,
@@ -33,7 +38,7 @@ try:
         build_feature_context_tensors,
         build_mlp_input_feature_tensor,
         compute_articulation_series,
-        derive_full_error_from_motion_error_np,
+        derive_full_error_from_mlp_output_np,
         find_all_real_data_csvs,
         load_truck_trailer_data_as_segment,
         normalize_feature_tensor,
@@ -46,9 +51,14 @@ except ImportError:
     from constants import (
         BASE_MODEL_PARAMS,
         MODEL_CHECKPOINT,
+        MLP_DROPOUT_P,
+        MLP_HIDDEN_DIM,
+        MLP_HIDDEN_LAYERS,
+        MLP_INPUT_FEATURE_NAMES,
+        MLP_OUTPUT_NAMES,
         MLP_NUMPY_DTYPE,
         MLP_TORCH_DTYPE,
-        MOTION_ERROR_NAMES,
+        REAL_DATA_LABEL,
         RUNS_ROOT,
         STATE_NAMES,
         TRAIN_LOSS_MODEL_CHECKPOINT,
@@ -58,7 +68,7 @@ except ImportError:
         build_feature_context_tensors,
         build_mlp_input_feature_tensor,
         compute_articulation_series,
-        derive_full_error_from_motion_error_np,
+        derive_full_error_from_mlp_output_np,
         find_all_real_data_csvs,
         load_truck_trailer_data_as_segment,
         normalize_feature_tensor,
@@ -126,6 +136,15 @@ def infer_model_dims_from_state_dict(state_dict: dict[str, torch.Tensor]) -> tup
     return int(linear_weights[0].shape[1]), int(linear_weights[-1].shape[0])
 
 
+def infer_hidden_config_from_state_dict(state_dict: dict[str, torch.Tensor]) -> tuple[int, int]:
+    linear_weights = [value for key, value in state_dict.items() if key.endswith(".weight") and value.ndim == 2]
+    if len(linear_weights) < 2:
+        return MLP_HIDDEN_DIM, MLP_HIDDEN_LAYERS
+    hidden_dim = int(linear_weights[0].shape[0])
+    hidden_layers = int(len(linear_weights) - 1)
+    return hidden_dim, hidden_layers
+
+
 def infer_layer_norm_from_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
     return "network.1.weight" in state_dict and "network.1.bias" in state_dict
 
@@ -139,10 +158,16 @@ def split_checkpoint_payload(payload: object) -> tuple[dict[str, torch.Tensor], 
             "loss_error_scale",
             "loss_pose_error_scale",
             "loss_motion_error_scale",
+            "loss_output_scale",
             "model_input_dim",
             "model_output_dim",
             "mlp_use_layer_norm",
+            "mlp_hidden_dim",
+            "mlp_hidden_layers",
+            "mlp_dropout_p",
             "input_feature_names",
+            "mlp_control_feature_names",
+            "mlp_output_names",
             "motion_error_names",
             "state_names",
             "control_names",
@@ -165,11 +190,11 @@ def extract_feature_context(metadata: dict[str, object]) -> dict[str, np.ndarray
     }
 
 
-def extract_motion_clip(metadata: dict[str, object]) -> np.ndarray | None:
-    motion_scale = metadata.get("loss_motion_error_scale")
-    if motion_scale is None:
+def extract_output_clip(metadata: dict[str, object]) -> np.ndarray | None:
+    output_scale = metadata.get("loss_output_scale")
+    if output_scale is None:
         return None
-    return 3.0 * np.asarray(motion_scale, dtype=MLP_NUMPY_DTYPE).reshape(-1)
+    return 3.0 * np.asarray(output_scale, dtype=MLP_NUMPY_DTYPE).reshape(-1)
 
 
 def extract_input_feature_names(metadata: dict[str, object], input_dim: int) -> list[str]:
@@ -189,20 +214,43 @@ def load_error_model(device: torch.device) -> tuple[MLPErrorModel, dict[str, obj
     input_dim, output_dim = infer_model_dims_from_state_dict(state_dict)
     input_dim = int(metadata.get("model_input_dim", input_dim))
     output_dim = int(metadata.get("model_output_dim", output_dim))
-    output_names_raw = metadata.get("motion_error_names")
+    if input_dim != len(MLP_INPUT_FEATURE_NAMES):
+        raise ValueError(
+            f"Checkpoint input_dim={input_dim}, expected {len(MLP_INPUT_FEATURE_NAMES)} for the relative-pose "
+            "truck-trailer residual MLP. Retrain train_main.py to create a compatible checkpoint."
+        )
+    output_names_raw = metadata.get("mlp_output_names", metadata.get("motion_error_names"))
     if output_names_raw is not None:
         output_names = [str(name) for name in np.asarray(output_names_raw).reshape(-1).tolist()]
-        if output_names != MOTION_ERROR_NAMES:
-            raise ValueError(f"Checkpoint output names={output_names}, expected {MOTION_ERROR_NAMES}.")
-    if output_dim != len(MOTION_ERROR_NAMES):
-        raise ValueError(f"Checkpoint output_dim={output_dim}, expected {len(MOTION_ERROR_NAMES)}.")
+        if output_names != MLP_OUTPUT_NAMES:
+            raise ValueError(
+                f"Checkpoint output names={output_names}, expected {MLP_OUTPUT_NAMES} for the relative-pose "
+                "truck-trailer residual MLP. Retrain train_main.py to create a compatible checkpoint."
+            )
+    if output_dim != len(MLP_OUTPUT_NAMES):
+        raise ValueError(
+            f"Checkpoint output_dim={output_dim}, expected {len(MLP_OUTPUT_NAMES)} for the relative-pose "
+            "truck-trailer residual MLP. Retrain train_main.py to create a compatible checkpoint."
+        )
 
     use_layer_norm = bool(metadata.get("mlp_use_layer_norm", infer_layer_norm_from_state_dict(state_dict)))
+    inferred_hidden_dim, inferred_hidden_layers = infer_hidden_config_from_state_dict(state_dict)
+    hidden_dim = int(metadata.get("mlp_hidden_dim", inferred_hidden_dim))
+    hidden_layers = int(metadata.get("mlp_hidden_layers", inferred_hidden_layers))
+    dropout_p = float(metadata.get("mlp_dropout_p", MLP_DROPOUT_P))
     metadata["input_feature_names"] = extract_input_feature_names(metadata, input_dim)
+    if metadata["input_feature_names"] and metadata["input_feature_names"] != MLP_INPUT_FEATURE_NAMES:
+        raise ValueError(
+            f"Checkpoint input features={metadata['input_feature_names']}, expected {MLP_INPUT_FEATURE_NAMES} "
+            "for the relative-pose truck-trailer residual MLP. Retrain train_main.py to create a compatible checkpoint."
+        )
     model = MLPErrorModel(
         input_dim=input_dim,
         output_dim=output_dim,
+        dropout_p=dropout_p,
         use_layer_norm=use_layer_norm,
+        hidden_dim=hidden_dim,
+        hidden_layers=hidden_layers,
     ).to(device=device, dtype=MLP_TORCH_DTYPE)
     model.load_state_dict(state_dict)
     model.eval()
@@ -245,7 +293,7 @@ def rollout_open_loop(
     dt_values: np.ndarray,
     device: torch.device,
     feature_context: dict[str, np.ndarray] | None,
-    motion_error_clip: np.ndarray | None,
+    mlp_output_clip: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     step_count = len(control_sequence) + 1
     base_rollout = np.zeros((step_count, len(STATE_NAMES)), dtype=np.float32)
@@ -281,14 +329,15 @@ def rollout_open_loop(
         features = build_mlp_input_feature_tensor(state_corr, control_tensor, mass_tensor, dt_tensor)
         if feature_context_tensors is not None:
             features = normalize_feature_tensor(features, feature_context_tensors)
-        predicted_motion_error = error_model(features).detach().cpu().numpy()[0].astype(np.float32)
-        if motion_error_clip is not None:
-            predicted_motion_error = np.clip(predicted_motion_error, -motion_error_clip, motion_error_clip)
+        predicted_mlp_output = error_model(features).detach().cpu().numpy()[0].astype(np.float32)
+        if mlp_output_clip is not None:
+            predicted_mlp_output = np.clip(predicted_mlp_output, -mlp_output_clip, mlp_output_clip)
 
-        corrected_error = derive_full_error_from_motion_error_np(
-            predicted_motion_error.reshape(1, -1),
+        corrected_error = derive_full_error_from_mlp_output_np(
+            predicted_mlp_output.reshape(1, -1),
             corr_base_next,
             np.array([dt_values[step]], dtype=np.float32),
+            np.array([trailer_mass_kg[step]], dtype=np.float32),
         )[0]
         corr_next = corr_base_next[0] + corrected_error
         corr_next[2] = wrap_angle_error_np(np.asarray([corr_next[2]], dtype=np.float32))[0]
@@ -425,7 +474,7 @@ def plot_controls(seg: InferenceSegment) -> Path:
 def plot_trajectory(seg: InferenceSegment, base_rollout: np.ndarray, corr_rollout: np.ndarray) -> Path:
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    axes[0].plot(seg.real_rollout[:, 0], seg.real_rollout[:, 1], label="CarSim/TruckSim", linewidth=1.9)
+    axes[0].plot(seg.real_rollout[:, 0], seg.real_rollout[:, 1], label=REAL_DATA_LABEL, linewidth=1.9)
     axes[0].plot(base_rollout[:, 0], base_rollout[:, 1], label="Base OpenLoop", linewidth=1.6)
     axes[0].plot(corr_rollout[:, 0], corr_rollout[:, 1], label="Base+NN OpenLoop", linewidth=1.7)
     axes[0].set_title("Tractor Trajectory")
@@ -435,7 +484,7 @@ def plot_trajectory(seg: InferenceSegment, base_rollout: np.ndarray, corr_rollou
     axes[0].legend()
     axes[0].set_aspect("equal", adjustable="box")
 
-    axes[1].plot(seg.real_rollout[:, 6], seg.real_rollout[:, 7], label="CarSim/TruckSim", linewidth=1.9)
+    axes[1].plot(seg.real_rollout[:, 6], seg.real_rollout[:, 7], label=REAL_DATA_LABEL, linewidth=1.9)
     axes[1].plot(base_rollout[:, 6], base_rollout[:, 7], label="Base OpenLoop", linewidth=1.6)
     axes[1].plot(corr_rollout[:, 6], corr_rollout[:, 7], label="Base+NN OpenLoop", linewidth=1.7)
     axes[1].set_title("Trailer Trajectory")
@@ -513,11 +562,11 @@ def main() -> None:
 
     base_model = build_base_model(checkpoint_metadata, device)
     feature_context = extract_feature_context(checkpoint_metadata)
-    motion_error_clip = extract_motion_clip(checkpoint_metadata)
+    mlp_output_clip = extract_output_clip(checkpoint_metadata)
     if feature_context is None:
         print("Checkpoint does not contain feature normalization statistics; raw features will be used.")
-    if motion_error_clip is None:
-        print("Checkpoint does not contain motion scaling; residual clipping is disabled.")
+    if mlp_output_clip is None:
+        print("Checkpoint does not contain output scaling; residual clipping is disabled.")
 
     summary_rows: list[dict[str, float]] = []
     processed_count = 0
@@ -538,7 +587,7 @@ def main() -> None:
             dt_values=seg.dt_values,
             device=device,
             feature_context=feature_context,
-            motion_error_clip=motion_error_clip,
+            mlp_output_clip=mlp_output_clip,
         )
 
         result_csv = export_results_csv(seg, base_rollout, corr_rollout)

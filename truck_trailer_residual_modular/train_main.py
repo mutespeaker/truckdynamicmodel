@@ -8,7 +8,7 @@ import torch
 
 try:
     from .base_model import TruckTrailerNominalDynamics
-    from .constants import BASE_MODEL_PARAMS, LEARNING_RATE, RUNS_ROOT, TRAIN_BATCH_SIZE, TRAIN_EPOCHS, TRAIN_NUM_WORKERS
+    from .constants import BASE_MODEL_PARAMS, LEARNING_RATE, MIN_LEARNING_RATE, RUNS_ROOT, TRAIN_BATCH_SIZE, TRAIN_EPOCHS, TRAIN_NUM_WORKERS
     from .data_utils import (
         SegmentData,
         build_train_val_by_segments,
@@ -26,7 +26,7 @@ try:
     )
 except ImportError:
     from base_model import TruckTrailerNominalDynamics
-    from constants import BASE_MODEL_PARAMS, LEARNING_RATE, RUNS_ROOT, TRAIN_BATCH_SIZE, TRAIN_EPOCHS, TRAIN_NUM_WORKERS
+    from constants import BASE_MODEL_PARAMS, LEARNING_RATE, MIN_LEARNING_RATE, RUNS_ROOT, TRAIN_BATCH_SIZE, TRAIN_EPOCHS, TRAIN_NUM_WORKERS
     from data_utils import (
         SegmentData,
         build_train_val_by_segments,
@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=10, help="Random seed.")
     parser.add_argument("--epochs", type=int, default=TRAIN_EPOCHS, help="Training epochs.")
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="Optimizer learning rate.")
+    parser.add_argument(
+        "--min-learning-rate",
+        type=float,
+        default=MIN_LEARNING_RATE,
+        help="Cosine annealing minimum learning rate.",
+    )
     parser.add_argument("--batch-size", type=int, default=TRAIN_BATCH_SIZE, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=TRAIN_NUM_WORKERS, help="DataLoader workers.")
     parser.add_argument(
@@ -135,6 +141,7 @@ def main() -> None:
         device=device,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
+        min_learning_rate=args.min_learning_rate,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )

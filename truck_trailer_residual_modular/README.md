@@ -34,6 +34,15 @@ The goal is to keep the same training and inference behavior while separating th
 - `base_model_demo.py`
   Standalone nominal base-model simulation entry, useful for checking the physics model without the residual network.
 
+- `TRAINING_PROCESS.md`
+  当前训练流程说明，整理了数据流、特征/标签构造、loss 设计、checkpoint 内容，以及最近一次 `train_segment` 实验。
+
+- `EXPERIMENT_REPRODUCTION.md`
+  实验复现说明，单独列出训练命令、开环验证命令，以及结果文件路径。
+
+- `DIFFERENTIABLE_DYNAMICS_PROXY_MODULE.md`
+  可微控制的动力学代理模型模块说明文档，从功能定位、算法原理、组织架构到关键结果，对当前模型做整体说明。
+
 ## How To Run
 
 From the project root:
@@ -58,6 +67,36 @@ python controltest/truck_trailer_residual_modular/train_main.py --run-dir "D:\te
 ```
 
 Single-run training is supported even when there is only one segment. In that case, the script keeps the same model and loss logic, and only changes the data split strategy: it uses the earlier part of the time series for training and the later part for validation.
+
+## Relative-Pose Residual MLP
+
+The residual model supports both no-trailer and trailer cases. If trailer columns are missing, the loader falls back to no-trailer mode:
+
+- `trailer_mass_kg = 0`
+- trailer state channels as placeholders mirrored from the tractor state
+
+When trailer columns and mass are available, the loader keeps the trailer states and uses `trailer_mass_kg` as the mode signal. In both cases:
+
+- rear-wheel drive torque is represented by the summed rear-axle command `torque_rl + torque_rr`
+- `dt = 0.02 s`, used by the base model and residual post-processing but not passed into the MLP
+
+The nominal base model still keeps the original 12-state / 5-control interface so existing loaders, plots, and rollout code remain compatible. The MLP itself stays translation-invariant:
+
+- MLP input features, 14 dimensions:
+  `trailer_mass_kg`, `has_trailer`, `vx_t`, `vy_t`, `r_t`, `vx_s`, `vy_s`, `r_s`, `rel_x_s_t`, `rel_y_s_t`, `sin_rel_yaw_s_t`, `cos_rel_yaw_s_t`, `steer_sw_rad`, `rear_drive_torque_sum`
+
+- MLP output residuals, 9 dimensions:
+  `vx_t`, `vy_t`, `r_t`, `vx_s`, `vy_s`, `r_s`, `rel_x_s_t`, `rel_y_s_t`, `rel_yaw_s_t`
+
+- Default hidden structure:
+  3 hidden layers, 128 units each, `LayerNorm + Tanh + Dropout`.
+
+Absolute position and `dt` are not sent into the MLP. Tractor `x/y/yaw` are rebuilt from velocity residuals, base yaw, and the fixed `0.02 s` step. For trailer cases, the model predicts trailer-to-tractor relative-pose residuals in the tractor body frame; `data_utils.py` then reconstructs trailer absolute `x/y/yaw` from corrected tractor pose plus corrected relative pose. For no-trailer cases, trailer placeholder channels are mirrored from the tractor correction.
+
+Older checkpoints trained with the previous 18-input / 6-output truck-trailer MLP, the intermediate 6-input / 3-output no-trailer MLP, or the 5-input fixed-dt MLP are not compatible with this relative-pose layout. Run `train_main.py` again to produce new checkpoints before running `inference_main.py`.
+
+For a fuller walkthrough of the current training path, see `TRAINING_PROCESS.md`.
+For the exact reproduction commands and output paths, see `EXPERIMENT_REPRODUCTION.md`.
 
 ## Inputs And Outputs
 
@@ -106,4 +145,4 @@ Single-run training is supported even when there is only one segment. In that ca
 - If this folder does not contain checkpoints yet, `inference_main.py` also tries the legacy checkpoints under `controltest/`.
 - If no compatible checkpoint exists yet, run `train_main.py` before `inference_main.py`.
 - The per-run inference output folder name is suffixed with `_modular` to avoid mixing results with the original scripts.
-- No-trailer data is supported. If trailer state columns are missing, the loader automatically switches to no-trailer mode and mirrors tractor channels into the trailer placeholder channels, matching the existing model assumptions.
+- With `FORCE_NO_TRAILER_MODE = False`, trailer data is used when complete trailer columns are present; otherwise the loader mirrors tractor channels into the trailer placeholder channels, sets trailer mass to zero, and uses a fixed `0.02 s` step.
