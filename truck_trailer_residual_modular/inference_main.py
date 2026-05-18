@@ -28,9 +28,9 @@ try:
         MLP_OUTPUT_NAMES,
         MLP_NUMPY_DTYPE,
         MLP_TORCH_DTYPE,
-        REAL_DATA_LABEL,
         RUNS_ROOT,
         STATE_NAMES,
+        TRACTOR_STATE_REFERENCE,
         TRAIN_LOSS_MODEL_CHECKPOINT,
     )
     from .data_utils import (
@@ -58,9 +58,9 @@ except ImportError:
         MLP_OUTPUT_NAMES,
         MLP_NUMPY_DTYPE,
         MLP_TORCH_DTYPE,
-        REAL_DATA_LABEL,
         RUNS_ROOT,
         STATE_NAMES,
+        TRACTOR_STATE_REFERENCE,
         TRAIN_LOSS_MODEL_CHECKPOINT,
     )
     from data_utils import (
@@ -81,6 +81,7 @@ except ImportError:
 @dataclass
 class InferenceSegment:
     csv_path: Path
+    scenario_name: str
     segment_name: str
     out_dir: Path
     time: np.ndarray
@@ -89,6 +90,30 @@ class InferenceSegment:
     initial_state: np.ndarray
     control_sequence: np.ndarray
     trailer_mass_kg: np.ndarray
+
+
+REAL_LABEL = "Real"
+BASE_LABEL = "Base"
+NN_LABEL = "Base + NN"
+MODE_TITLES = {
+    "single_step": "Single-Step",
+    "recursive_rollout": "Recursive Rollout",
+}
+STATE_PLOT_META: dict[str, tuple[str, str]] = {
+    "x_t": ("Tractor Rear-Axle X", "m"),
+    "y_t": ("Tractor Rear-Axle Y", "m"),
+    "psi_t": ("Tractor Rear-Axle Yaw", "deg"),
+    "vx_t": ("Tractor Rear-Axle Vx", "m/s"),
+    "vy_t": ("Tractor Rear-Axle Vy", "m/s"),
+    "r_t": ("Tractor Yaw Rate", "deg/s"),
+    "x_s": ("Trailer X", "m"),
+    "y_s": ("Trailer Y", "m"),
+    "psi_s": ("Trailer Yaw", "deg"),
+    "vx_s": ("Trailer Vx", "m/s"),
+    "vy_s": ("Trailer Vy", "m/s"),
+    "r_s": ("Trailer Yaw Rate", "deg/s"),
+    "articulation": ("Articulation", "deg"),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,10 +134,47 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional summary csv path. Defaults to a per-run file for single-input mode or a global file otherwise.",
     )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help="Optional checkpoint .pth path, run directory, or checkpoint directory. "
+        "If omitted, inference_main.py falls back to the default checkpoint locations.",
+    )
     return parser.parse_args()
 
 
-def pick_checkpoint_path() -> Path:
+def resolve_checkpoint_path_from_input(checkpoint_path: Path) -> Path:
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint path does not exist: {checkpoint_path}")
+
+    if checkpoint_path.is_file():
+        return checkpoint_path
+
+    candidate_files = [
+        checkpoint_path / MODEL_CHECKPOINT.name,
+        checkpoint_path / TRAIN_LOSS_MODEL_CHECKPOINT.name,
+        checkpoint_path / "checkpoints" / MODEL_CHECKPOINT.name,
+        checkpoint_path / "checkpoints" / TRAIN_LOSS_MODEL_CHECKPOINT.name,
+    ]
+    for candidate in candidate_files:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    pth_files = sorted(checkpoint_path.rglob("*.pth"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if pth_files:
+        return pth_files[0]
+
+    raise FileNotFoundError(
+        "Could not find a .pth checkpoint under the specified checkpoint path. "
+        f"Tried common candidates under: {checkpoint_path}"
+    )
+
+
+def pick_checkpoint_path(checkpoint_path: Path | None = None) -> Path:
+    if checkpoint_path is not None:
+        return resolve_checkpoint_path_from_input(checkpoint_path)
     if MODEL_CHECKPOINT.exists():
         return MODEL_CHECKPOINT
     if TRAIN_LOSS_MODEL_CHECKPOINT.exists():
@@ -172,6 +234,7 @@ def split_checkpoint_payload(payload: object) -> tuple[dict[str, torch.Tensor], 
             "state_names",
             "control_names",
             "base_model_params",
+            "tractor_state_reference",
         ):
             if key in payload:
                 metadata[key] = payload[key]
@@ -191,10 +254,11 @@ def extract_feature_context(metadata: dict[str, object]) -> dict[str, np.ndarray
 
 
 def extract_output_clip(metadata: dict[str, object]) -> np.ndarray | None:
-    output_scale = metadata.get("loss_output_scale")
-    if output_scale is None:
-        return None
-    return 3.0 * np.asarray(output_scale, dtype=MLP_NUMPY_DTYPE).reshape(-1)
+    # Keep the saved output-scale metadata for analysis, but do not apply any
+    # hard clipping during rollout. This removes the inference-time safety
+    # boundary without changing the trained network weights or normalization.
+    _ = metadata
+    return None
 
 
 def extract_input_feature_names(metadata: dict[str, object], input_dim: int) -> list[str]:
@@ -207,8 +271,8 @@ def extract_input_feature_names(metadata: dict[str, object], input_dim: int) -> 
     return names
 
 
-def load_error_model(device: torch.device) -> tuple[MLPErrorModel, dict[str, object], Path]:
-    checkpoint_path = pick_checkpoint_path()
+def load_error_model(device: torch.device, checkpoint_path: Path | None = None) -> tuple[MLPErrorModel, dict[str, object], Path]:
+    checkpoint_path = pick_checkpoint_path(checkpoint_path)
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict, metadata = split_checkpoint_payload(payload)
     input_dim, output_dim = infer_model_dims_from_state_dict(state_dict)
@@ -231,6 +295,12 @@ def load_error_model(device: torch.device) -> tuple[MLPErrorModel, dict[str, obj
         raise ValueError(
             f"Checkpoint output_dim={output_dim}, expected {len(MLP_OUTPUT_NAMES)} for the relative-pose "
             "truck-trailer residual MLP. Retrain train_main.py to create a compatible checkpoint."
+        )
+    tractor_state_reference = metadata.get("tractor_state_reference")
+    if tractor_state_reference != TRACTOR_STATE_REFERENCE:
+        raise ValueError(
+            f"Checkpoint tractor_state_reference={tractor_state_reference!r}, expected {TRACTOR_STATE_REFERENCE!r}. "
+            "Retrain train_main.py to create a checkpoint compatible with tractor rear-axle-center states."
         )
 
     use_layer_norm = bool(metadata.get("mlp_use_layer_norm", infer_layer_norm_from_state_dict(state_dict)))
@@ -267,13 +337,26 @@ def build_base_model(metadata: dict[str, object], device: torch.device) -> Truck
     return model
 
 
+def resolve_output_dir(csv_path: Path) -> Path:
+    out_dir = csv_path.parent / f"{csv_path.stem}_inference_eval_modular"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def save_inference_figure(fig: plt.Figure, output_path: Path, top_margin: float = 1.0) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, top_margin))
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
 def load_segment(csv_path: Path) -> InferenceSegment:
     seg = load_truck_trailer_data_as_segment(csv_path)
-    out_dir = csv_path.parent / "truck_trailer_open_loop_eval_modular"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = resolve_output_dir(csv_path)
     return InferenceSegment(
         csv_path=seg.csv_path,
-        segment_name=seg.segment_name,
+        scenario_name=seg.segment_name,
+        segment_name=csv_path.stem,
         out_dir=out_dir,
         time=seg.time,
         dt_values=seg.dt_values,
@@ -284,7 +367,84 @@ def load_segment(csv_path: Path) -> InferenceSegment:
     )
 
 
-def rollout_open_loop(
+@torch.no_grad()
+def predict_base_and_nn_next_from_state(
+    base_model: TruckTrailerNominalDynamics,
+    error_model: MLPErrorModel,
+    current_state: np.ndarray,
+    control_step: np.ndarray,
+    trailer_mass_kg_step: float,
+    dt_value: float,
+    device: torch.device,
+    feature_context_tensors: dict[str, torch.Tensor] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    dt = np.array([[dt_value]], dtype=np.float32)
+    control = control_step.reshape(1, -1).astype(np.float32)
+    state = current_state.reshape(1, -1).astype(np.float32)
+    mass = np.array([[trailer_mass_kg_step]], dtype=np.float32)
+
+    state_tensor = to_tensor(state, device)
+    control_tensor = to_tensor(control, device)
+    mass_tensor = to_tensor(mass, device)
+    dt_tensor = to_tensor(dt, device)
+
+    base_next = base_model(state_tensor, control_tensor, mass_tensor, dt_tensor).cpu().numpy().astype(np.float32)
+    if not np.isfinite(base_next).all():
+        raise FloatingPointError("Base inference produced a non-finite state.")
+
+    features = build_mlp_input_feature_tensor(state_tensor, control_tensor, mass_tensor, dt_tensor)
+    if feature_context_tensors is not None:
+        features = normalize_feature_tensor(features, feature_context_tensors)
+    predicted_mlp_output = error_model(features).cpu().numpy()[0].astype(np.float32)
+    corrected_error = derive_full_error_from_mlp_output_np(
+        predicted_mlp_output.reshape(1, -1),
+        base_next,
+        np.array([dt_value], dtype=np.float32),
+        np.array([trailer_mass_kg_step], dtype=np.float32),
+    )[0]
+    nn_next = base_next[0] + corrected_error
+    nn_next[2] = wrap_angle_error_np(np.asarray([nn_next[2]], dtype=np.float32))[0]
+    nn_next[8] = wrap_angle_error_np(np.asarray([nn_next[8]], dtype=np.float32))[0]
+    if not np.isfinite(nn_next).all():
+        nn_next = base_next[0].copy()
+
+    return base_next[0], nn_next.astype(np.float32)
+
+
+def rollout_single_step(
+    base_model: TruckTrailerNominalDynamics,
+    error_model: MLPErrorModel,
+    real_rollout: np.ndarray,
+    control_sequence: np.ndarray,
+    trailer_mass_kg: np.ndarray,
+    dt_values: np.ndarray,
+    device: torch.device,
+    feature_context_tensors: dict[str, torch.Tensor] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    step_count = len(control_sequence) + 1
+    base_rollout = np.zeros((step_count, len(STATE_NAMES)), dtype=np.float32)
+    nn_rollout = np.zeros((step_count, len(STATE_NAMES)), dtype=np.float32)
+    base_rollout[0] = real_rollout[0].astype(np.float32)
+    nn_rollout[0] = real_rollout[0].astype(np.float32)
+
+    for step in range(len(control_sequence)):
+        base_next, nn_next = predict_base_and_nn_next_from_state(
+            base_model=base_model,
+            error_model=error_model,
+            current_state=real_rollout[step],
+            control_step=control_sequence[step],
+            trailer_mass_kg_step=float(trailer_mass_kg[step]),
+            dt_value=float(dt_values[step]),
+            device=device,
+            feature_context_tensors=feature_context_tensors,
+        )
+        base_rollout[step + 1] = base_next
+        nn_rollout[step + 1] = nn_next
+
+    return base_rollout, nn_rollout
+
+
+def rollout_recursive(
     base_model: TruckTrailerNominalDynamics,
     error_model: MLPErrorModel,
     initial_state: np.ndarray,
@@ -292,61 +452,39 @@ def rollout_open_loop(
     trailer_mass_kg: np.ndarray,
     dt_values: np.ndarray,
     device: torch.device,
-    feature_context: dict[str, np.ndarray] | None,
-    mlp_output_clip: np.ndarray | None,
+    feature_context_tensors: dict[str, torch.Tensor] | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     step_count = len(control_sequence) + 1
     base_rollout = np.zeros((step_count, len(STATE_NAMES)), dtype=np.float32)
-    corr_rollout = np.zeros((step_count, len(STATE_NAMES)), dtype=np.float32)
+    nn_rollout = np.zeros((step_count, len(STATE_NAMES)), dtype=np.float32)
     base_rollout[0] = initial_state.astype(np.float32)
-    corr_rollout[0] = initial_state.astype(np.float32)
-
-    feature_context_tensors = None
-    if feature_context is not None:
-        feature_context_tensors = build_feature_context_tensors(feature_context, device)
+    nn_rollout[0] = initial_state.astype(np.float32)
 
     for step in range(len(control_sequence)):
-        dt = np.array([[dt_values[step]]], dtype=np.float32)
-        u = control_sequence[step : step + 1].astype(np.float32)
-        mass = np.array([[trailer_mass_kg[step]]], dtype=np.float32)
-
-        state_base = to_tensor(base_rollout[step : step + 1], device)
-        state_corr = to_tensor(corr_rollout[step : step + 1], device)
-        control_tensor = to_tensor(u, device)
-        mass_tensor = to_tensor(mass, device)
-        dt_tensor = to_tensor(dt, device)
-
-        base_next = base_model(state_base, control_tensor, mass_tensor, dt_tensor).cpu().numpy().astype(np.float32)[0]
-        if not np.isfinite(base_next).all():
-            raise FloatingPointError(f"Base rollout produced non-finite state at step={step}.")
+        base_next, _ = predict_base_and_nn_next_from_state(
+            base_model=base_model,
+            error_model=error_model,
+            current_state=base_rollout[step],
+            control_step=control_sequence[step],
+            trailer_mass_kg_step=float(trailer_mass_kg[step]),
+            dt_value=float(dt_values[step]),
+            device=device,
+            feature_context_tensors=feature_context_tensors,
+        )
+        _, nn_next = predict_base_and_nn_next_from_state(
+            base_model=base_model,
+            error_model=error_model,
+            current_state=nn_rollout[step],
+            control_step=control_sequence[step],
+            trailer_mass_kg_step=float(trailer_mass_kg[step]),
+            dt_value=float(dt_values[step]),
+            device=device,
+            feature_context_tensors=feature_context_tensors,
+        )
         base_rollout[step + 1] = base_next
+        nn_rollout[step + 1] = nn_next
 
-        if not np.isfinite(corr_rollout[step]).all():
-            corr_rollout[step] = base_rollout[step].copy()
-            state_corr = to_tensor(corr_rollout[step : step + 1], device)
-
-        corr_base_next = base_model(state_corr, control_tensor, mass_tensor, dt_tensor).cpu().numpy().astype(np.float32)
-        features = build_mlp_input_feature_tensor(state_corr, control_tensor, mass_tensor, dt_tensor)
-        if feature_context_tensors is not None:
-            features = normalize_feature_tensor(features, feature_context_tensors)
-        predicted_mlp_output = error_model(features).detach().cpu().numpy()[0].astype(np.float32)
-        if mlp_output_clip is not None:
-            predicted_mlp_output = np.clip(predicted_mlp_output, -mlp_output_clip, mlp_output_clip)
-
-        corrected_error = derive_full_error_from_mlp_output_np(
-            predicted_mlp_output.reshape(1, -1),
-            corr_base_next,
-            np.array([dt_values[step]], dtype=np.float32),
-            np.array([trailer_mass_kg[step]], dtype=np.float32),
-        )[0]
-        corr_next = corr_base_next[0] + corrected_error
-        corr_next[2] = wrap_angle_error_np(np.asarray([corr_next[2]], dtype=np.float32))[0]
-        corr_next[8] = wrap_angle_error_np(np.asarray([corr_next[8]], dtype=np.float32))[0]
-        if not np.isfinite(corr_next).all():
-            corr_next = corr_base_next[0].copy()
-        corr_rollout[step + 1] = corr_next.astype(np.float32)
-
-    return base_rollout, corr_rollout
+    return base_rollout, nn_rollout
 
 
 def pad_control_series(values: np.ndarray) -> np.ndarray:
@@ -364,10 +502,10 @@ def compute_state_error_series(predicted_states: np.ndarray, reference_states: n
     return predicted_states[:, index] - reference_states[:, index]
 
 
-def build_open_loop_results_dataframe(
+def build_results_dataframe(
     seg: InferenceSegment,
     base_rollout: np.ndarray,
-    corr_rollout: np.ndarray,
+    nn_rollout: np.ndarray,
 ) -> pd.DataFrame:
     time = seg.time.astype(np.float32)
     steer_sw_deg = np.rad2deg(pad_control_series(seg.control_sequence[:, 0]))
@@ -391,7 +529,7 @@ def build_open_loop_results_dataframe(
         }
     )
 
-    for prefix, rollout in (("real", seg.real_rollout), ("base", base_rollout), ("corr", corr_rollout)):
+    for prefix, rollout in (("real", seg.real_rollout), ("base", base_rollout), ("nn", nn_rollout)):
         for index, name in enumerate(STATE_NAMES):
             values = rollout[:, index]
             if name in {"psi_t", "psi_s"}:
@@ -406,38 +544,38 @@ def build_open_loop_results_dataframe(
     for name in plot_error_names:
         if name == "articulation":
             err_base = compute_articulation_series(base_rollout) - compute_articulation_series(seg.real_rollout)
-            err_corr = compute_articulation_series(corr_rollout) - compute_articulation_series(seg.real_rollout)
+            err_nn = compute_articulation_series(nn_rollout) - compute_articulation_series(seg.real_rollout)
         else:
             err_base = compute_state_error_series(base_rollout, seg.real_rollout, name)
-            err_corr = compute_state_error_series(corr_rollout, seg.real_rollout, name)
+            err_nn = compute_state_error_series(nn_rollout, seg.real_rollout, name)
         df[f"err_base_{name}"] = err_base.astype(np.float32)
-        df[f"err_corr_{name}"] = err_corr.astype(np.float32)
+        df[f"err_nn_{name}"] = err_nn.astype(np.float32)
 
     return df
 
 
-def compute_rmse_summary(seg: InferenceSegment, base_rollout: np.ndarray, corr_rollout: np.ndarray) -> dict[str, float]:
-    summary: dict[str, float] = {
-        "segment_name": seg.segment_name,
-        "csv_path": str(seg.csv_path),
-        "sample_count": int(len(seg.real_rollout)),
-        "mean_trailer_mass_kg": float(np.mean(seg.trailer_mass_kg)),
-    }
+def compute_rmse_summary(
+    seg: InferenceSegment,
+    base_rollout: np.ndarray,
+    nn_rollout: np.ndarray,
+    prefix: str,
+) -> dict[str, float]:
+    summary: dict[str, float] = {}
     for name in STATE_NAMES:
         err_base = compute_state_error_series(base_rollout, seg.real_rollout, name).astype(np.float64)
-        err_corr = compute_state_error_series(corr_rollout, seg.real_rollout, name).astype(np.float64)
-        summary[f"rmse_base_{name}"] = float(np.sqrt(np.mean(err_base * err_base)))
-        summary[f"rmse_corr_{name}"] = float(np.sqrt(np.mean(err_corr * err_corr)))
+        err_nn = compute_state_error_series(nn_rollout, seg.real_rollout, name).astype(np.float64)
+        summary[f"{prefix}_rmse_base_{name}"] = float(np.sqrt(np.mean(err_base * err_base)))
+        summary[f"{prefix}_rmse_nn_{name}"] = float(np.sqrt(np.mean(err_nn * err_nn)))
     err_base_art = (compute_articulation_series(base_rollout) - compute_articulation_series(seg.real_rollout)).astype(np.float64)
-    err_corr_art = (compute_articulation_series(corr_rollout) - compute_articulation_series(seg.real_rollout)).astype(np.float64)
-    summary["rmse_base_articulation_deg"] = float(np.sqrt(np.mean(err_base_art * err_base_art)))
-    summary["rmse_corr_articulation_deg"] = float(np.sqrt(np.mean(err_corr_art * err_corr_art)))
+    err_nn_art = (compute_articulation_series(nn_rollout) - compute_articulation_series(seg.real_rollout)).astype(np.float64)
+    summary[f"{prefix}_rmse_base_articulation_deg"] = float(np.sqrt(np.mean(err_base_art * err_base_art)))
+    summary[f"{prefix}_rmse_nn_articulation_deg"] = float(np.sqrt(np.mean(err_nn_art * err_nn_art)))
     return summary
 
 
-def export_results_csv(seg: InferenceSegment, base_rollout: np.ndarray, corr_rollout: np.ndarray) -> Path:
-    out_path = seg.out_dir / "open_loop_results.csv"
-    build_open_loop_results_dataframe(seg, base_rollout, corr_rollout).to_csv(out_path, index=False, encoding="utf-8-sig")
+def export_results_csv(seg: InferenceSegment, mode_key: str, base_rollout: np.ndarray, nn_rollout: np.ndarray) -> Path:
+    out_path = seg.out_dir / f"{mode_key}_results.csv"
+    build_results_dataframe(seg, base_rollout, nn_rollout).to_csv(out_path, index=False, encoding="utf-8-sig")
     return out_path
 
 
@@ -471,64 +609,75 @@ def plot_controls(seg: InferenceSegment) -> Path:
     return out_path
 
 
-def plot_trajectory(seg: InferenceSegment, base_rollout: np.ndarray, corr_rollout: np.ndarray) -> Path:
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+def plot_trajectory(seg: InferenceSegment, mode_key: str, base_rollout: np.ndarray, nn_rollout: np.ndarray) -> Path:
+    mode_title = MODE_TITLES[mode_key]
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
-    axes[0].plot(seg.real_rollout[:, 0], seg.real_rollout[:, 1], label=REAL_DATA_LABEL, linewidth=1.9)
-    axes[0].plot(base_rollout[:, 0], base_rollout[:, 1], label="Base OpenLoop", linewidth=1.6)
-    axes[0].plot(corr_rollout[:, 0], corr_rollout[:, 1], label="Base+NN OpenLoop", linewidth=1.7)
-    axes[0].set_title("Tractor Trajectory")
+    axes[0].plot(seg.real_rollout[:, 0], seg.real_rollout[:, 1], label=REAL_LABEL, linewidth=1.9)
+    axes[0].plot(base_rollout[:, 0], base_rollout[:, 1], label=BASE_LABEL, linewidth=1.6)
+    axes[0].plot(nn_rollout[:, 0], nn_rollout[:, 1], label=NN_LABEL, linewidth=1.7)
+    axes[0].set_title(f"{mode_title} Tractor Trajectory")
     axes[0].set_xlabel("X (m)")
     axes[0].set_ylabel("Y (m)")
     axes[0].grid(True, linestyle="--", alpha=0.35)
-    axes[0].legend()
     axes[0].set_aspect("equal", adjustable="box")
 
-    axes[1].plot(seg.real_rollout[:, 6], seg.real_rollout[:, 7], label=REAL_DATA_LABEL, linewidth=1.9)
-    axes[1].plot(base_rollout[:, 6], base_rollout[:, 7], label="Base OpenLoop", linewidth=1.6)
-    axes[1].plot(corr_rollout[:, 6], corr_rollout[:, 7], label="Base+NN OpenLoop", linewidth=1.7)
-    axes[1].set_title("Trailer Trajectory")
+    axes[1].plot(seg.real_rollout[:, 6], seg.real_rollout[:, 7], label=REAL_LABEL, linewidth=1.9)
+    axes[1].plot(base_rollout[:, 6], base_rollout[:, 7], label=BASE_LABEL, linewidth=1.6)
+    axes[1].plot(nn_rollout[:, 6], nn_rollout[:, 7], label=NN_LABEL, linewidth=1.7)
+    axes[1].set_title(f"{mode_title} Trailer Trajectory")
     axes[1].set_xlabel("X (m)")
     axes[1].set_ylabel("Y (m)")
     axes[1].grid(True, linestyle="--", alpha=0.35)
-    axes[1].legend()
     axes[1].set_aspect("equal", adjustable="box")
 
-    out_path = seg.out_dir / "open_loop_trajectory.png"
-    save_figure(fig, out_path)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.02))
+
+    out_path = seg.out_dir / f"{mode_key}_trajectory.png"
+    save_inference_figure(fig, out_path, top_margin=0.92)
     return out_path
 
 
-def plot_state_error_all(seg: InferenceSegment, base_rollout: np.ndarray, corr_rollout: np.ndarray) -> Path:
+def plot_state_error_all(seg: InferenceSegment, mode_key: str, base_rollout: np.ndarray, nn_rollout: np.ndarray) -> Path:
     plot_names = STATE_NAMES + ["articulation"]
-    fig, axes = plt.subplots(5, 3, figsize=(16, 16), sharex=True)
+    mode_title = MODE_TITLES[mode_key]
+    fig, axes = plt.subplots(5, 3, figsize=(18, 16), sharex=True)
     axes = axes.ravel()
 
     for axis, name in zip(axes, plot_names, strict=False):
+        display_name, ylabel = STATE_PLOT_META[name]
         if name == "articulation":
             err_base = compute_articulation_series(base_rollout) - compute_articulation_series(seg.real_rollout)
-            err_corr = compute_articulation_series(corr_rollout) - compute_articulation_series(seg.real_rollout)
-            ylabel = "deg"
+            err_nn = compute_articulation_series(nn_rollout) - compute_articulation_series(seg.real_rollout)
         else:
             err_base = compute_state_error_series(base_rollout, seg.real_rollout, name)
-            err_corr = compute_state_error_series(corr_rollout, seg.real_rollout, name)
-            ylabel = "deg" if name in {"psi_t", "psi_s", "r_t", "r_s"} else "m/mps"
-        axis.plot(seg.time, err_base, label="Base OpenLoop - Real", linewidth=1.4)
-        axis.plot(seg.time, err_corr, label="Base+NN OpenLoop - Real", linewidth=1.6)
+            err_nn = compute_state_error_series(nn_rollout, seg.real_rollout, name)
+        axis.plot(seg.time, err_base, label=f"{BASE_LABEL} - {REAL_LABEL}", linewidth=1.4)
+        axis.plot(seg.time, err_nn, label=f"{NN_LABEL} - {REAL_LABEL}", linewidth=1.6)
         axis.axhline(0.0, color="black", linewidth=0.8, linestyle=":")
-        axis.set_title(f"{name} error")
+        axis.set_title(f"{mode_title} {display_name} Error")
         axis.set_ylabel(ylabel)
         axis.grid(True, linestyle="--", alpha=0.35)
 
     for axis in axes[len(plot_names):]:
         axis.axis("off")
 
-    axes[-1].set_xlabel("Time (s)")
-    axes[0].legend(loc="best")
+    for axis in axes[-3:]:
+        axis.set_xlabel("Time (s)")
 
-    out_path = seg.out_dir / "open_loop_state_errors.png"
-    save_figure(fig, out_path)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.02))
+
+    out_path = seg.out_dir / f"{mode_key}_state_errors.png"
+    save_inference_figure(fig, out_path, top_margin=0.94)
     return out_path
+
+
+def export_segment_summary_csv(summary: dict[str, float | str], output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([summary]).to_csv(output_path, index=False, encoding="utf-8-sig")
+    return output_path
 
 
 def export_summary_csv(rows: list[dict[str, float]], output_path: Path) -> Path:
@@ -557,16 +706,19 @@ def main() -> None:
         print(f"Using specified root: {Path(args.input_path)}")
         print(f"Resolved {len(csvs)} candidate segments. Latest file: {csvs[0]}")
 
-    error_model, checkpoint_metadata, checkpoint_path = load_error_model(device)
+    error_model, checkpoint_metadata, checkpoint_path = load_error_model(device, args.checkpoint_path)
     print(f"Loaded checkpoint: {checkpoint_path}")
 
     base_model = build_base_model(checkpoint_metadata, device)
     feature_context = extract_feature_context(checkpoint_metadata)
     mlp_output_clip = extract_output_clip(checkpoint_metadata)
+    feature_context_tensors = None
+    if feature_context is not None:
+        feature_context_tensors = build_feature_context_tensors(feature_context, device)
     if feature_context is None:
         print("Checkpoint does not contain feature normalization statistics; raw features will be used.")
     if mlp_output_clip is None:
-        print("Checkpoint does not contain output scaling; residual clipping is disabled.")
+        print("Residual clipping is disabled; saved output scaling remains available in the checkpoint for analysis only.")
 
     summary_rows: list[dict[str, float]] = []
     processed_count = 0
@@ -578,7 +730,17 @@ def main() -> None:
             print(f"[Skip] {csv_path}: {exc}")
             continue
 
-        base_rollout, corr_rollout = rollout_open_loop(
+        single_step_base, single_step_nn = rollout_single_step(
+            base_model=base_model,
+            error_model=error_model,
+            real_rollout=seg.real_rollout,
+            control_sequence=seg.control_sequence,
+            trailer_mass_kg=seg.trailer_mass_kg,
+            dt_values=seg.dt_values,
+            device=device,
+            feature_context_tensors=feature_context_tensors,
+        )
+        recursive_base, recursive_nn = rollout_recursive(
             base_model=base_model,
             error_model=error_model,
             initial_state=seg.initial_state,
@@ -586,28 +748,46 @@ def main() -> None:
             trailer_mass_kg=seg.trailer_mass_kg,
             dt_values=seg.dt_values,
             device=device,
-            feature_context=feature_context,
-            mlp_output_clip=mlp_output_clip,
+            feature_context_tensors=feature_context_tensors,
         )
 
-        result_csv = export_results_csv(seg, base_rollout, corr_rollout)
         controls_png = plot_controls(seg)
-        traj_png = plot_trajectory(seg, base_rollout, corr_rollout)
-        errors_png = plot_state_error_all(seg, base_rollout, corr_rollout)
-        summary = compute_rmse_summary(seg, base_rollout, corr_rollout)
+        single_step_result_csv = export_results_csv(seg, "single_step", single_step_base, single_step_nn)
+        single_step_traj_png = plot_trajectory(seg, "single_step", single_step_base, single_step_nn)
+        single_step_errors_png = plot_state_error_all(seg, "single_step", single_step_base, single_step_nn)
+        recursive_result_csv = export_results_csv(seg, "recursive_rollout", recursive_base, recursive_nn)
+        recursive_traj_png = plot_trajectory(seg, "recursive_rollout", recursive_base, recursive_nn)
+        recursive_errors_png = plot_state_error_all(seg, "recursive_rollout", recursive_base, recursive_nn)
+        summary: dict[str, float | str] = {
+            "scenario_name": seg.scenario_name,
+            "segment_name": seg.segment_name,
+            "csv_path": str(seg.csv_path),
+            "output_dir": str(seg.out_dir),
+            "sample_count": int(len(seg.real_rollout)),
+            "mean_trailer_mass_kg": float(np.mean(seg.trailer_mass_kg)),
+        }
+        summary.update(compute_rmse_summary(seg, single_step_base, single_step_nn, "single_step"))
+        summary.update(compute_rmse_summary(seg, recursive_base, recursive_nn, "recursive"))
+        segment_summary_csv = export_segment_summary_csv(summary, seg.out_dir / "rmse_summary.csv")
         summary_rows.append(summary)
         processed_count += 1
 
         print(f"\n[OK] {seg.segment_name}")
+        print(f"  scene   : {seg.scenario_name}")
         print(f"  out_dir : {seg.out_dir}")
-        print(f"  results : {result_csv.name}")
         print(f"  controls: {controls_png.name}")
-        print(f"  traj    : {traj_png.name}")
-        print(f"  errors  : {errors_png.name}")
+        print(f"  single  : {single_step_result_csv.name}, {single_step_traj_png.name}, {single_step_errors_png.name}")
+        print(f"  recur   : {recursive_result_csv.name}, {recursive_traj_png.name}, {recursive_errors_png.name}")
+        print(f"  summary : {segment_summary_csv.name}")
         print(
-            "  articulation rmse (deg): "
-            f"base={summary['rmse_base_articulation_deg']:.4f}, "
-            f"corr={summary['rmse_corr_articulation_deg']:.4f}"
+            "  single-step articulation rmse (deg): "
+            f"base={summary['single_step_rmse_base_articulation_deg']:.4f}, "
+            f"nn={summary['single_step_rmse_nn_articulation_deg']:.4f}"
+        )
+        print(
+            "  recursive articulation rmse (deg): "
+            f"base={summary['recursive_rmse_base_articulation_deg']:.4f}, "
+            f"nn={summary['recursive_rmse_nn_articulation_deg']:.4f}"
         )
 
     if processed_count == 0:
@@ -616,15 +796,15 @@ def main() -> None:
     if args.summary_path is not None:
         summary_output_path = args.summary_path
     elif args.input_path is not None and len(csvs) == 1:
-        summary_output_path = csvs[0].parent / "truck_trailer_open_loop_summary_modular.csv"
+        summary_output_path = resolve_output_dir(csvs[0]) / "truck_trailer_inference_summary_modular.csv"
     elif args.input_path is not None and Path(args.input_path).is_dir():
-        summary_output_path = Path(args.input_path) / "truck_trailer_open_loop_summary_modular.csv"
+        summary_output_path = Path(args.input_path) / "truck_trailer_inference_summary_modular.csv"
     else:
-        summary_output_path = RUNS_ROOT / "truck_trailer_open_loop_summary_modular.csv"
+        summary_output_path = RUNS_ROOT / "truck_trailer_inference_summary_modular.csv"
 
     summary_path = export_summary_csv(summary_rows, summary_output_path)
     print(f"\nsummary csv: {summary_path}")
-    print(f"Completed {processed_count} open-loop inference runs.")
+    print(f"Completed {processed_count} inference runs.")
 
 
 if __name__ == "__main__":

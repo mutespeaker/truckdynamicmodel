@@ -68,6 +68,12 @@ python controltest/truck_trailer_residual_modular/train_main.py --run-dir "D:\te
 
 Single-run training is supported even when there is only one segment. In that case, the script keeps the same model and loss logic, and only changes the data split strategy: it uses the earlier part of the time series for training and the later part for validation.
 
+If you want to tune the local smoothness constraint explicitly during training, you can pass:
+
+```bash
+python controltest/truck_trailer_residual_modular/train_main.py --vx-vy-r-smoothness-weight 1.0e-2
+```
+
 ## Relative-Pose Residual MLP
 
 The residual model supports both no-trailer and trailer cases. If trailer columns are missing, the loader falls back to no-trailer mode:
@@ -82,6 +88,9 @@ When trailer columns and mass are available, the loader keeps the trailer states
 
 The nominal base model still keeps the original 12-state / 5-control interface so existing loaders, plots, and rollout code remain compatible. The MLP itself stays translation-invariant:
 
+- tractor `x_t, y_t, vx_t, vy_t` are interpreted at the tractor rear-axle center
+- the nominal base model converts tractor rear-axle-center states to its internal tractor reference point only inside `base_model.py`
+
 - MLP input features, 14 dimensions:
   `trailer_mass_kg`, `has_trailer`, `vx_t`, `vy_t`, `r_t`, `vx_s`, `vy_s`, `r_s`, `rel_x_s_t`, `rel_y_s_t`, `sin_rel_yaw_s_t`, `cos_rel_yaw_s_t`, `steer_sw_rad`, `rear_drive_torque_sum`
 
@@ -91,9 +100,14 @@ The nominal base model still keeps the original 12-state / 5-control interface s
 - Default hidden structure:
   3 hidden layers, 128 units each, `LayerNorm + Tanh + Dropout`.
 
+- Local Vx/Vy/R smoothness regularizer:
+  training now applies a small-perturbation consistency penalty on tractor `vx_t`, `vy_t`, and `r_t` while keeping the control input fixed. This reduces cases where nearly identical motion states produce disproportionately different corrected next states. The regularizer strength is controlled by `--vx-vy-r-smoothness-weight`.
+
 Absolute position and `dt` are not sent into the MLP. Tractor `x/y/yaw` are rebuilt from velocity residuals, base yaw, and the fixed `0.02 s` step. For trailer cases, the model predicts trailer-to-tractor relative-pose residuals in the tractor body frame; `data_utils.py` then reconstructs trailer absolute `x/y/yaw` from corrected tractor pose plus corrected relative pose. For no-trailer cases, trailer placeholder channels are mirrored from the tractor correction.
 
 Older checkpoints trained with the previous 18-input / 6-output truck-trailer MLP, the intermediate 6-input / 3-output no-trailer MLP, or the 5-input fixed-dt MLP are not compatible with this relative-pose layout. Run `train_main.py` again to produce new checkpoints before running `inference_main.py`.
+
+Checkpoints created before the tractor-state semantics were switched to rear-axle-center states are also incompatible, even if the tensor dimensions match. Retrain `train_main.py` after this update before using `inference_main.py`.
 
 For a fuller walkthrough of the current training path, see `TRAINING_PROCESS.md`.
 For the exact reproduction commands and output paths, see `EXPERIMENT_REPRODUCTION.md`.

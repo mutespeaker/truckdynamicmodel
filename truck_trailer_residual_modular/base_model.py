@@ -51,6 +51,40 @@ class TruckTrailerNominalDynamics(nn.Module):
         sign = torch.where(velocity >= 0.0, 1.0, -1.0).to(dtype=velocity.dtype, device=velocity.device)
         return sign * torch.clamp(torch.abs(velocity), min=float(self.min_speed_mps.item()))
 
+    def _external_state_to_internal(self, state: torch.Tensor) -> torch.Tensor:
+        # External tractor states are provided at the tractor rear-axle center.
+        # The nominal dynamics below are written around the tractor body reference
+        # point used by the original model, so we convert rear-axle states to that
+        # internal reference before evaluating the derivatives.
+        internal_state = state.clone()
+        b_t = self.L_t - self.a_t
+
+        psi_t = state[:, 2]
+        r_t = state[:, 5]
+        cos_psi_t = torch.cos(psi_t)
+        sin_psi_t = torch.sin(psi_t)
+
+        internal_state[:, 0] = state[:, 0] + b_t * cos_psi_t
+        internal_state[:, 1] = state[:, 1] + b_t * sin_psi_t
+        internal_state[:, 3] = state[:, 3]
+        internal_state[:, 4] = state[:, 4] + b_t * r_t
+        return internal_state
+
+    def _internal_state_to_external(self, state: torch.Tensor) -> torch.Tensor:
+        external_state = state.clone()
+        b_t = self.L_t - self.a_t
+
+        psi_t = state[:, 2]
+        r_t = state[:, 5]
+        cos_psi_t = torch.cos(psi_t)
+        sin_psi_t = torch.sin(psi_t)
+
+        external_state[:, 0] = state[:, 0] - b_t * cos_psi_t
+        external_state[:, 1] = state[:, 1] - b_t * sin_psi_t
+        external_state[:, 3] = state[:, 3]
+        external_state[:, 4] = state[:, 4] - b_t * r_t
+        return external_state
+
     def derivatives(self, state: torch.Tensor, control: torch.Tensor, trailer_mass_kg: torch.Tensor) -> torch.Tensor:
         if trailer_mass_kg.ndim == 2 and trailer_mass_kg.shape[1] == 1:
             trailer_mass_kg = trailer_mass_kg[:, 0]
@@ -193,12 +227,18 @@ class TruckTrailerNominalDynamics(nn.Module):
         if trailer_mass_kg.ndim == 1:
             trailer_mass_kg = trailer_mass_kg.unsqueeze(1)
 
-        k1 = self.derivatives(state, control, trailer_mass_kg)
-        k2 = self.derivatives(state + 0.5 * dt * k1, control, trailer_mass_kg)
-        k3 = self.derivatives(state + 0.5 * dt * k2, control, trailer_mass_kg)
-        k4 = self.derivatives(state + dt * k3, control, trailer_mass_kg)
-        next_state = state + dt * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
-        next_state = next_state.clone()
+        internal_state = self._external_state_to_internal(state)
+
+        k1 = self.derivatives(internal_state, control, trailer_mass_kg)
+        k2 = self.derivatives(internal_state + 0.5 * dt * k1, control, trailer_mass_kg)
+        k3 = self.derivatives(internal_state + 0.5 * dt * k2, control, trailer_mass_kg)
+        k4 = self.derivatives(internal_state + dt * k3, control, trailer_mass_kg)
+        next_state_internal = internal_state + dt * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+        next_state_internal = next_state_internal.clone()
+        next_state_internal[:, 2] = wrap_angle_error_torch(next_state_internal[:, 2])
+        next_state_internal[:, 8] = wrap_angle_error_torch(next_state_internal[:, 8])
+
+        next_state = self._internal_state_to_external(next_state_internal)
         no_trailer_mask = trailer_mass_kg[:, 0] <= self.no_trailer_mass_threshold_kg
         if torch.any(no_trailer_mask):
             next_state[no_trailer_mask, 6] = next_state[no_trailer_mask, 0]

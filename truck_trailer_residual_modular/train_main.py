@@ -1,14 +1,31 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
+import hashlib
+import json
 from pathlib import Path
+import re
 
 import numpy as np
+import pandas as pd
 import torch
 
 try:
     from .base_model import TruckTrailerNominalDynamics
-    from .constants import BASE_MODEL_PARAMS, LEARNING_RATE, MIN_LEARNING_RATE, RUNS_ROOT, TRAIN_BATCH_SIZE, TRAIN_EPOCHS, TRAIN_NUM_WORKERS
+    from .constants import (
+        BASE_MODEL_PARAMS,
+        LEARNING_RATE,
+        MIN_LEARNING_RATE,
+        RUNS_ROOT,
+        TRAIN_BATCH_SIZE,
+        TRAIN_EPOCHS,
+        TRAIN_NUM_WORKERS,
+        VXYR_SMOOTHNESS_DELTA_R_DEGPS,
+        VXYR_SMOOTHNESS_DELTA_VX_MPS,
+        VXYR_SMOOTHNESS_DELTA_VY_MPS,
+        VXYR_SMOOTHNESS_WEIGHT,
+    )
     from .data_utils import (
         SegmentData,
         build_train_val_by_segments,
@@ -26,7 +43,19 @@ try:
     )
 except ImportError:
     from base_model import TruckTrailerNominalDynamics
-    from constants import BASE_MODEL_PARAMS, LEARNING_RATE, MIN_LEARNING_RATE, RUNS_ROOT, TRAIN_BATCH_SIZE, TRAIN_EPOCHS, TRAIN_NUM_WORKERS
+    from constants import (
+        BASE_MODEL_PARAMS,
+        LEARNING_RATE,
+        MIN_LEARNING_RATE,
+        RUNS_ROOT,
+        TRAIN_BATCH_SIZE,
+        TRAIN_EPOCHS,
+        TRAIN_NUM_WORKERS,
+        VXYR_SMOOTHNESS_DELTA_R_DEGPS,
+        VXYR_SMOOTHNESS_DELTA_VX_MPS,
+        VXYR_SMOOTHNESS_DELTA_VY_MPS,
+        VXYR_SMOOTHNESS_WEIGHT,
+    )
     from data_utils import (
         SegmentData,
         build_train_val_by_segments,
@@ -56,8 +85,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional carsim_runs root, run directory, outputs directory, or control_and_trajectory.csv path.",
     )
-    parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation ratio. Single-segment mode uses a tail split.")
-    parser.add_argument("--seed", type=int, default=10, help="Random seed.")
+    parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation ratio. Single-segment mode uses a tail split.")
+    parser.add_argument("--seed", type=int, default=100, help="Random seed.")
     parser.add_argument("--epochs", type=int, default=TRAIN_EPOCHS, help="Training epochs.")
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="Optimizer learning rate.")
     parser.add_argument(
@@ -69,15 +98,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=TRAIN_BATCH_SIZE, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=TRAIN_NUM_WORKERS, help="DataLoader workers.")
     parser.add_argument(
+        "--vx-vy-r-smoothness-weight",
+        type=float,
+        default=VXYR_SMOOTHNESS_WEIGHT,
+        help="Local smoothness regularization weight for small tractor Vx/Vy/yaw-rate perturbations under the same control input.",
+    )
+    parser.add_argument(
         "--summary-dir",
         type=Path,
         default=None,
-        help="Optional directory for summary outputs. Defaults to a global folder or the target run's outputs folder.",
+        help="Optional parent directory for training runs. A dedicated run subdirectory will be created inside it.",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Optional run name. Defaults to a timestamped name derived from the input scope.",
     )
     return parser.parse_args()
 
 
-def resolve_summary_dir(args: argparse.Namespace, csv_list: list[Path]) -> Path:
+def sanitize_name(value: str) -> str:
+    sanitized = re.sub(r"[^0-9A-Za-z._-]+", "_", value.strip())
+    sanitized = sanitized.strip("._-")
+    return sanitized or "run"
+
+
+def compact_name(value: str, max_length: int = 48) -> str:
+    sanitized = sanitize_name(value)
+    if len(sanitized) <= max_length:
+        return sanitized
+    digest = hashlib.sha1(sanitized.encode("utf-8")).hexdigest()[:8]
+    head_length = max(8, max_length - len(digest) - 1)
+    return f"{sanitized[:head_length]}_{digest}"
+
+
+def resolve_summary_root(args: argparse.Namespace, csv_list: list[Path]) -> Path:
     if args.summary_dir is not None:
         return args.summary_dir
     if args.input_path is not None and len(csv_list) == 1:
@@ -85,6 +141,72 @@ def resolve_summary_dir(args: argparse.Namespace, csv_list: list[Path]) -> Path:
     if args.input_path is not None and Path(args.input_path).is_dir():
         return Path(args.input_path) / "truck_trailer_multirun_training_summary_modular"
     return RUNS_ROOT / "truck_trailer_multirun_training_summary_modular"
+
+
+def build_default_run_name(args: argparse.Namespace, csv_list: list[Path]) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.input_path is None:
+        scope_token = "runs_root"
+    elif len(csv_list) == 1:
+        scope_token = csv_list[0].stem
+    else:
+        scope_token = Path(args.input_path).name
+    scope_slug = compact_name(scope_token, max_length=20)
+    return f"run_{timestamp}_{scope_slug}_e{int(args.epochs)}_s{int(args.seed)}"
+
+
+def create_run_dir(summary_root: Path, run_name: str) -> Path:
+    summary_root.mkdir(parents=True, exist_ok=True)
+    candidate = summary_root / compact_name(run_name, max_length=48)
+    if not candidate.exists():
+        candidate.mkdir(parents=True, exist_ok=False)
+        return candidate
+
+    suffix = 2
+    while True:
+        numbered = summary_root / f"{compact_name(run_name, max_length=44)}_{suffix:02d}"
+        if not numbered.exists():
+            numbered.mkdir(parents=True, exist_ok=False)
+            return numbered
+        suffix += 1
+
+
+def build_validation_dir_token(seg: SegmentData) -> str:
+    stem = seg.csv_path.stem
+    match = re.match(r"(?P<stamp>\d{8}_\d{6})\.(?P<frac>\d{5})_interpolated_train_segment_(?P<seg>\d+)$", stem)
+    if match is not None:
+        seg_index = int(match.group("seg"))
+        return f"{match.group('stamp')}_{match.group('frac')}_s{seg_index:03d}"
+    return compact_name(stem, max_length=24)
+
+
+def build_validation_plot_dir(run_dir: Path, seg: SegmentData, index: int) -> Path:
+    scenario_token = compact_name(
+        seg.csv_path.parent.parent.name if len(seg.csv_path.parents) >= 2 else seg.segment_name,
+        max_length=12,
+    )
+    csv_token = build_validation_dir_token(seg)
+    out_dir = run_dir / "val_rollouts" / f"{index:03d}_{scenario_token}_{csv_token}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def export_training_history_csv(history: dict[str, list[float]], output_dir: Path) -> Path:
+    output_path = output_dir / "truck_trailer_training_history.csv"
+    pd.DataFrame(history).to_csv(output_path, index=False, encoding="utf-8-sig")
+    return output_path
+
+
+def export_validation_rollout_summary(rows: list[dict[str, object]], output_dir: Path) -> Path:
+    output_path = output_dir / "truck_trailer_validation_rollout_summary.csv"
+    pd.DataFrame(rows).to_csv(output_path, index=False, encoding="utf-8-sig")
+    return output_path
+
+
+def save_run_metadata(metadata: dict[str, object], output_dir: Path) -> Path:
+    output_path = output_dir / "run_metadata.json"
+    output_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    return output_path
 
 
 def main() -> None:
@@ -128,13 +250,21 @@ def main() -> None:
     if len(segments) == 1:
         print("Single-segment mode is active: train/val were split along time without changing model logic.")
 
-    global_plot_dir = resolve_summary_dir(args, csv_list)
-    split_table_path, val_table_path = export_dataset_split_tables(train_segments, val_segments, global_plot_dir)
+    summary_root = resolve_summary_root(args, csv_list)
+    run_name = args.run_name if args.run_name is not None else build_default_run_name(args, csv_list)
+    run_dir = create_run_dir(summary_root, run_name)
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Summary root      : {summary_root}")
+    print(f"Active run dir    : {run_dir}")
+    print(f"Run checkpoints   : {checkpoint_dir}")
+
+    split_table_path, val_table_path = export_dataset_split_tables(train_segments, val_segments, run_dir)
     print(f"Saved split table : {split_table_path}")
     print(f"Saved val table   : {val_table_path}")
 
     base_model = TruckTrailerNominalDynamics(BASE_MODEL_PARAMS).to(device)
-    error_model, feature_context, loss_context, history = train_error_model_multirun(
+    error_model, feature_context, loss_context, history, checkpoint_paths = train_error_model_multirun(
         base_model=base_model,
         train_segments=train_segments,
         val_segments=val_segments,
@@ -144,13 +274,21 @@ def main() -> None:
         min_learning_rate=args.min_learning_rate,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        checkpoint_dir=checkpoint_dir,
+        export_compatibility_checkpoints=True,
+        vx_vy_r_smoothness_weight=args.vx_vy_r_smoothness_weight,
     )
 
-    loss_plot = plot_training_history(history, global_plot_dir)
+    loss_plot = plot_training_history(history, run_dir)
+    history_csv = export_training_history_csv(history, run_dir)
     print(f"Saved training history plot: {loss_plot}")
+    print(f"Saved training history csv : {history_csv}")
+    for label, path in checkpoint_paths.items():
+        print(f"Saved checkpoint [{label}]: {path}")
 
     print("\n===== Validation Rollout =====")
-    for seg in val_segments:
+    validation_rows: list[dict[str, object]] = []
+    for index, seg in enumerate(val_segments):
         base_rollout, corrected_rollout = rollout_models_teacher_forcing(
             base_model=base_model,
             error_model=error_model,
@@ -162,12 +300,58 @@ def main() -> None:
             loss_context=loss_context,
             device=device,
         )
-        traj_path = plot_trajectory(seg.real_rollout, base_rollout, corrected_rollout, seg.plot_dir)
-        state_path = plot_key_state_timeseries(seg.time, seg.real_rollout, base_rollout, corrected_rollout, seg.plot_dir)
+        validation_plot_dir = build_validation_plot_dir(run_dir, seg, index)
+        traj_path = plot_trajectory(seg.real_rollout, base_rollout, corrected_rollout, validation_plot_dir)
+        state_path = plot_key_state_timeseries(seg.time, seg.real_rollout, base_rollout, corrected_rollout, validation_plot_dir)
         rmse = print_rollout_rmse(seg.real_rollout, base_rollout, corrected_rollout)
+        validation_rows.append(
+            {
+                "index_in_val": index,
+                "segment_name": seg.segment_name,
+                "csv_path": str(seg.csv_path),
+                "plot_dir": str(validation_plot_dir),
+                **rmse,
+            }
+        )
         print(f"[{seg.segment_name}] trajectory plot: {traj_path}")
         print(f"[{seg.segment_name}] state plot     : {state_path}")
         print(f"[{seg.segment_name}] rmse summary   : {rmse}")
+
+    validation_summary_path = export_validation_rollout_summary(validation_rows, run_dir)
+    metadata_path = save_run_metadata(
+        {
+            "run_name": run_dir.name,
+            "run_dir": str(run_dir),
+            "summary_root": str(summary_root),
+            "input_path": None if args.input_path is None else str(args.input_path),
+            "resolved_csv_count": len(csv_list),
+            "loaded_segment_count": len(segments),
+            "train_segment_count": len(train_segments),
+            "val_segment_count": len(val_segments),
+            "seed": int(args.seed),
+            "epochs": int(args.epochs),
+            "learning_rate": float(args.learning_rate),
+            "min_learning_rate": float(args.min_learning_rate),
+            "batch_size": int(args.batch_size),
+            "num_workers": int(args.num_workers),
+            "vx_vy_r_smoothness_weight": float(args.vx_vy_r_smoothness_weight),
+            "vx_vy_r_smoothness_delta_vx_mps": float(VXYR_SMOOTHNESS_DELTA_VX_MPS),
+            "vx_vy_r_smoothness_delta_vy_mps": float(VXYR_SMOOTHNESS_DELTA_VY_MPS),
+            "vx_vy_r_smoothness_delta_r_degps": float(VXYR_SMOOTHNESS_DELTA_R_DEGPS),
+            "device": str(device),
+            "checkpoint_paths": {key: str(path) for key, path in checkpoint_paths.items()},
+            "artifacts": {
+                "split_table": str(split_table_path),
+                "validation_segments_table": str(val_table_path),
+                "training_history_plot": str(loss_plot),
+                "training_history_csv": str(history_csv),
+                "validation_rollout_summary": str(validation_summary_path),
+            },
+        },
+        run_dir,
+    )
+    print(f"Saved validation summary : {validation_summary_path}")
+    print(f"Saved run metadata       : {metadata_path}")
 
 
 if __name__ == "__main__":

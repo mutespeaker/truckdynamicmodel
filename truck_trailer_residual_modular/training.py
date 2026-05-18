@@ -39,9 +39,14 @@ try:
         TRAIN_EPOCHS,
         TRAIN_LOSS_MODEL_CHECKPOINT,
         TRAIN_NUM_WORKERS,
+        TRACTOR_STATE_REFERENCE,
         TURNING_SAMPLER_POWER,
         TURNING_SELECTION_BLEND,
         BASE_MODEL_PARAMS,
+        VXYR_SMOOTHNESS_DELTA_R_DEGPS,
+        VXYR_SMOOTHNESS_DELTA_VX_MPS,
+        VXYR_SMOOTHNESS_DELTA_VY_MPS,
+        VXYR_SMOOTHNESS_WEIGHT,
     )
     from .data_utils import (
         SegmentData,
@@ -91,9 +96,14 @@ except ImportError:
         TRAIN_EPOCHS,
         TRAIN_LOSS_MODEL_CHECKPOINT,
         TRAIN_NUM_WORKERS,
+        TRACTOR_STATE_REFERENCE,
         TURNING_SAMPLER_POWER,
         TURNING_SELECTION_BLEND,
         BASE_MODEL_PARAMS,
+        VXYR_SMOOTHNESS_DELTA_R_DEGPS,
+        VXYR_SMOOTHNESS_DELTA_VX_MPS,
+        VXYR_SMOOTHNESS_DELTA_VY_MPS,
+        VXYR_SMOOTHNESS_WEIGHT,
     )
     from data_utils import (
         SegmentData,
@@ -129,6 +139,8 @@ VALIDATION_DIRECTION_CHANNELS = (
     ("vx_s", STATE_NAMES.index("vx_s")),
     ("vy_s", STATE_NAMES.index("vy_s")),
 )
+VXYR_SMOOTHNESS_FEATURE_NAMES = ("vx_t", "vy_t", "r_t")
+VXYR_SMOOTHNESS_STATE_NAMES = tuple(STATE_NAMES)
 
 
 def compute_loss_components(
@@ -205,6 +217,7 @@ def build_checkpoint_payload(
     feature_context: dict[str, np.ndarray],
     loss_context: dict[str, torch.Tensor],
     turning_focus_context: dict[str, float] | None = None,
+    vx_vy_r_smoothness_config: dict[str, object] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "state_dict": state_dict,
@@ -226,6 +239,7 @@ def build_checkpoint_payload(
         "loss_motion_error_scale": loss_context["motion_error_scale"].detach().cpu().numpy(),
         "loss_output_scale": loss_context["output_scale"].detach().cpu().numpy(),
         "base_model_params": dict(BASE_MODEL_PARAMS),
+        "tractor_state_reference": TRACTOR_STATE_REFERENCE,
     }
     if turning_focus_context is not None:
         payload["turning_focus_context"] = {
@@ -238,6 +252,17 @@ def build_checkpoint_payload(
             "sample_weight_max": float(turning_focus_context["sample_weight_max"]),
             "sampler_power": float(TURNING_SAMPLER_POWER),
             "selection_blend": float(TURNING_SELECTION_BLEND),
+        }
+    if vx_vy_r_smoothness_config is not None:
+        payload["vx_vy_r_smoothness"] = {
+            "weight": float(vx_vy_r_smoothness_config["weight"]),
+            "feature_names": list(vx_vy_r_smoothness_config["feature_names"]),
+            "state_names": list(vx_vy_r_smoothness_config["state_names"]),
+            "delta_vx_mps": float(vx_vy_r_smoothness_config["delta_vx_mps"]),
+            "delta_vy_mps": float(vx_vy_r_smoothness_config["delta_vy_mps"]),
+            "delta_r_degps": float(vx_vy_r_smoothness_config["delta_r_degps"]),
+            "active_feature_indices": list(vx_vy_r_smoothness_config["active_feature_indices"]),
+            "regularized_state_indices": list(vx_vy_r_smoothness_config["regularized_state_indices"]),
         }
     return payload
 
@@ -303,6 +328,97 @@ def compute_pose_loss_weight(global_step: int) -> float:
     return 1.0
 
 
+def reduce_per_sample_loss(loss_per_sample: torch.Tensor, sample_weight: torch.Tensor | None = None) -> torch.Tensor:
+    if sample_weight is not None:
+        sample_weight = sample_weight.reshape(-1).to(device=loss_per_sample.device, dtype=MLP_TORCH_DTYPE)
+        weight_sum = torch.clamp(sample_weight.sum(), min=1.0e-6)
+        return torch.sum(loss_per_sample * sample_weight) / weight_sum
+    if loss_per_sample.numel() == 0:
+        return torch.zeros((), device=loss_per_sample.device, dtype=MLP_TORCH_DTYPE)
+    return torch.mean(loss_per_sample)
+
+
+def build_vx_vy_r_smoothness_config(
+    feature_context: dict[str, np.ndarray],
+    device: torch.device,
+    weight: float,
+) -> dict[str, object] | None:
+    if weight <= 0.0:
+        return None
+
+    feature_scale = feature_context["feature_scale"].reshape(-1).astype(np.float32)
+    perturb_raw_by_name = {
+        "vx_t": float(VXYR_SMOOTHNESS_DELTA_VX_MPS),
+        "vy_t": float(VXYR_SMOOTHNESS_DELTA_VY_MPS),
+        "r_t": float(np.deg2rad(VXYR_SMOOTHNESS_DELTA_R_DEGPS)),
+    }
+    perturb_norm = np.zeros((1, len(MLP_INPUT_FEATURE_NAMES)), dtype=np.float32)
+    active_feature_indices: list[int] = []
+    for feature_name in VXYR_SMOOTHNESS_FEATURE_NAMES:
+        feature_index = MLP_INPUT_FEATURE_NAMES.index(feature_name)
+        scale_value = float(max(feature_scale[feature_index], 1.0e-6))
+        perturb_norm[0, feature_index] = float(perturb_raw_by_name[feature_name]) / scale_value
+        active_feature_indices.append(feature_index)
+
+    regularized_state_indices = [STATE_NAMES.index(name) for name in VXYR_SMOOTHNESS_STATE_NAMES]
+    return {
+        "weight": float(weight),
+        "feature_names": list(VXYR_SMOOTHNESS_FEATURE_NAMES),
+        "state_names": list(VXYR_SMOOTHNESS_STATE_NAMES),
+        "delta_vx_mps": float(VXYR_SMOOTHNESS_DELTA_VX_MPS),
+        "delta_vy_mps": float(VXYR_SMOOTHNESS_DELTA_VY_MPS),
+        "delta_r_degps": float(VXYR_SMOOTHNESS_DELTA_R_DEGPS),
+        "active_feature_indices": list(active_feature_indices),
+        "regularized_state_indices": list(regularized_state_indices),
+        "perturb_norm_tensor": torch.as_tensor(perturb_norm, dtype=MLP_TORCH_DTYPE, device=device),
+    }
+
+
+def compute_vx_vy_r_smoothness_loss(
+    model: nn.Module,
+    x_batch: torch.Tensor,
+    base_next: torch.Tensor,
+    dt_values: torch.Tensor,
+    trailer_mass_kg: torch.Tensor,
+    loss_context: dict[str, torch.Tensor],
+    smoothness_config: dict[str, object] | None,
+    sample_weight: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    if smoothness_config is None:
+        zero_scalar = torch.zeros((), device=x_batch.device, dtype=MLP_TORCH_DTYPE)
+        zero_vector = torch.zeros((x_batch.shape[0],), device=x_batch.device, dtype=MLP_TORCH_DTYPE)
+        return {
+            "loss": zero_scalar,
+            "loss_per_sample": zero_vector,
+        }
+
+    perturb_norm = smoothness_config["perturb_norm_tensor"]
+    perturb_noise = (2.0 * torch.rand_like(x_batch) - 1.0) * perturb_norm.to(device=x_batch.device, dtype=x_batch.dtype)
+    perturbed_x_batch = x_batch + perturb_noise
+
+    was_training = model.training
+    model.train(False)
+    try:
+        reference_output = model(x_batch)
+        perturbed_output = model(perturbed_x_batch)
+    finally:
+        model.train(was_training)
+
+    reference_error = derive_full_error_from_mlp_output_torch(reference_output, base_next, dt_values, trailer_mass_kg)
+    perturbed_error = derive_full_error_from_mlp_output_torch(perturbed_output, base_next, dt_values, trailer_mass_kg)
+    regularized_state_indices = smoothness_config["regularized_state_indices"]
+    error_scale = loss_context["error_scale"].to(dtype=MLP_TORCH_DTYPE)[:, regularized_state_indices]
+    channel_weight = loss_context["channel_weight"].to(dtype=MLP_TORCH_DTYPE)[:, regularized_state_indices]
+
+    smoothness_residual = (perturbed_error[:, regularized_state_indices] - reference_error[:, regularized_state_indices]) / error_scale
+    smoothness_loss_per_sample = torch.mean((smoothness_residual * channel_weight).square(), dim=1)
+    smoothness_loss = reduce_per_sample_loss(smoothness_loss_per_sample, sample_weight)
+    return {
+        "loss": smoothness_loss,
+        "loss_per_sample": smoothness_loss_per_sample,
+    }
+
+
 def initialize_validation_mse_sums() -> dict[str, float]:
     return {f"{scope}_{name}": 0.0 for scope in ("base", "corr") for name, _ in VALIDATION_DIRECTION_CHANNELS}
 
@@ -353,7 +469,10 @@ def train_error_model_multirun(
     min_learning_rate: float = MIN_LEARNING_RATE,
     batch_size: int = TRAIN_BATCH_SIZE,
     num_workers: int = TRAIN_NUM_WORKERS,
-) -> tuple[MLPErrorModel, dict[str, np.ndarray], dict[str, torch.Tensor], dict[str, list[float]]]:
+    checkpoint_dir: Path | None = None,
+    export_compatibility_checkpoints: bool = True,
+    vx_vy_r_smoothness_weight: float = VXYR_SMOOTHNESS_WEIGHT,
+) -> tuple[MLPErrorModel, dict[str, np.ndarray], dict[str, torch.Tensor], dict[str, list[float]], dict[str, Path]]:
     if learning_rate <= 0.0:
         raise ValueError(f"learning_rate must be positive, got {learning_rate}.")
     if min_learning_rate < 0.0:
@@ -362,6 +481,14 @@ def train_error_model_multirun(
         raise ValueError(
             f"min_learning_rate ({min_learning_rate}) must not be greater than learning_rate ({learning_rate})."
         )
+    if vx_vy_r_smoothness_weight < 0.0:
+        raise ValueError(
+            f"vx_vy_r_smoothness_weight must be non-negative, got {vx_vy_r_smoothness_weight}."
+        )
+    if checkpoint_dir is None:
+        checkpoint_dir = MODEL_CHECKPOINT.parent
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     x_train_raw, y_train_output, y_train, base_next_train, train_dt_values, train_mass, train_turn_scores = concat_segments_for_training(
         base_model,
@@ -381,6 +508,11 @@ def train_error_model_multirun(
     x_train = normalize_features_np(x_train_raw, feature_context)
     x_val = normalize_features_np(x_val_raw, feature_context)
     loss_context = build_loss_context(y_train, y_train_output, device)
+    smoothness_config = build_vx_vy_r_smoothness_config(
+        feature_context=feature_context,
+        device=device,
+        weight=vx_vy_r_smoothness_weight,
+    )
     turning_focus_context = fit_turning_focus_context(train_turn_scores)
     train_turn_mask = compute_turning_focus_mask(train_turn_scores, turning_focus_context)
     val_turn_mask = compute_turning_focus_mask(val_turn_scores, turning_focus_context)
@@ -467,7 +599,10 @@ def train_error_model_multirun(
         "val_pose": [],
         "train_motion": [],
         "val_motion": [],
+        "train_smoothness": [],
+        "val_smoothness": [],
         "pose_loss_weight": [],
+        "smoothness_weight": [],
         "val_turn_focus_total": [],
         "val_selection_score": [],
         "learning_rate": [],
@@ -477,6 +612,7 @@ def train_error_model_multirun(
     best_train_loss = float("inf")
     best_state_dict: dict[str, torch.Tensor] | None = None
     best_train_state_dict: dict[str, torch.Tensor] | None = None
+    checkpoint_paths: dict[str, Path] = {}
     global_step = 0
     validation_mse_history = {f"val_mse_{scope}_{name}": [] for scope in ("base", "corr") for name, _ in VALIDATION_DIRECTION_CHANNELS}
     history.update(validation_mse_history)
@@ -486,6 +622,7 @@ def train_error_model_multirun(
         train_total = 0.0
         train_pose = 0.0
         train_motion = 0.0
+        train_smoothness = 0.0
         train_count = 0
         pose_loss_weight = compute_pose_loss_weight(global_step)
         epoch_learning_rate = get_current_learning_rate(optimizer)
@@ -513,6 +650,22 @@ def train_error_model_multirun(
                 pose_loss_weight=pose_loss_weight,
                 sample_weight=sample_weight_batch,
             )
+            smoothness_losses = compute_vx_vy_r_smoothness_loss(
+                model=model,
+                x_batch=x_batch,
+                base_next=base_next_batch,
+                dt_values=dt_batch,
+                trailer_mass_kg=mass_batch,
+                loss_context=loss_context,
+                smoothness_config=smoothness_config,
+                sample_weight=sample_weight_batch,
+            )
+            total_loss_per_sample = losses["total_loss_per_sample"] + float(vx_vy_r_smoothness_weight) * smoothness_losses["loss_per_sample"]
+            losses["supervised_total_loss"] = losses["total_loss"]
+            losses["smoothness_loss"] = smoothness_losses["loss"]
+            losses["total_loss_per_sample"] = total_loss_per_sample
+            losses["total_loss"] = reduce_per_sample_loss(total_loss_per_sample, sample_weight_batch)
+
             losses["total_loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
             optimizer.step()
@@ -523,6 +676,7 @@ def train_error_model_multirun(
             train_total += float(losses["total_loss"].detach().cpu()) * batch_size_value
             train_pose += float(losses["pose_loss"].detach().cpu()) * batch_size_value
             train_motion += float(losses["motion_loss"].detach().cpu()) * batch_size_value
+            train_smoothness += float(losses["smoothness_loss"].detach().cpu()) * batch_size_value
             train_count += batch_size_value
 
         model.eval()
@@ -530,6 +684,7 @@ def train_error_model_multirun(
         val_total = 0.0
         val_pose = 0.0
         val_motion = 0.0
+        val_smoothness = 0.0
         val_turn_focus_weighted_sum = 0.0
         val_turn_focus_weight_sum = 0.0
         val_count = 0
@@ -555,6 +710,21 @@ def train_error_model_multirun(
                     loss_context=loss_context,
                     pose_loss_weight=val_pose_loss_weight,
                 )
+                smoothness_losses = compute_vx_vy_r_smoothness_loss(
+                    model=model,
+                    x_batch=x_batch,
+                    base_next=base_next_batch,
+                    dt_values=dt_batch,
+                    trailer_mass_kg=mass_batch,
+                    loss_context=loss_context,
+                    smoothness_config=smoothness_config,
+                    sample_weight=None,
+                )
+                total_loss_per_sample = losses["total_loss_per_sample"] + float(vx_vy_r_smoothness_weight) * smoothness_losses["loss_per_sample"]
+                losses["supervised_total_loss"] = losses["total_loss"]
+                losses["smoothness_loss"] = smoothness_losses["loss"]
+                losses["total_loss_per_sample"] = total_loss_per_sample
+                losses["total_loss"] = reduce_per_sample_loss(total_loss_per_sample, sample_weight=None)
                 turn_mask = turn_mask_batch.reshape(-1) > 0.5
                 if torch.any(turn_mask):
                     turn_losses = losses["total_loss_per_sample"][turn_mask]
@@ -565,15 +735,18 @@ def train_error_model_multirun(
                 val_total += float(losses["total_loss"].detach().cpu()) * batch_size_value
                 val_pose += float(losses["pose_loss"].detach().cpu()) * batch_size_value
                 val_motion += float(losses["motion_loss"].detach().cpu()) * batch_size_value
+                val_smoothness += float(losses["smoothness_loss"].detach().cpu()) * batch_size_value
                 val_count += batch_size_value
                 update_validation_mse_sums(validation_mse_sums, base_next_batch, losses["predicted_error"], y_batch)
 
         train_total /= max(train_count, 1)
         train_pose /= max(train_count, 1)
         train_motion /= max(train_count, 1)
+        train_smoothness /= max(train_count, 1)
         val_total /= max(val_count, 1)
         val_pose /= max(val_count, 1)
         val_motion /= max(val_count, 1)
+        val_smoothness /= max(val_count, 1)
         if val_turn_focus_weight_sum > 1.0e-6:
             val_turn_focus_total = val_turn_focus_weighted_sum / val_turn_focus_weight_sum
         else:
@@ -587,7 +760,10 @@ def train_error_model_multirun(
         history["val_pose"].append(val_pose)
         history["train_motion"].append(train_motion)
         history["val_motion"].append(val_motion)
+        history["train_smoothness"].append(train_smoothness)
+        history["val_smoothness"].append(val_smoothness)
         history["pose_loss_weight"].append(val_pose_loss_weight)
+        history["smoothness_weight"].append(float(vx_vy_r_smoothness_weight))
         history["val_turn_focus_total"].append(val_turn_focus_total)
         history["val_selection_score"].append(val_selection_score)
         history["learning_rate"].append(epoch_learning_rate)
@@ -605,28 +781,52 @@ def train_error_model_multirun(
             displacement_line, velocity_line = format_validation_mse_lines(validation_mse)
             print(
                 f"Epoch {epoch:5d}/{epochs} | step={global_step:6d} | lr={epoch_learning_rate:.6e} | "
-                f"pose_w={val_pose_loss_weight:.3f} | "
+                f"pose_w={val_pose_loss_weight:.3f} smooth_w={float(vx_vy_r_smoothness_weight):.3e} | "
                 f"train_total={train_total:.6e} val_total={val_total:.6e} val_turn={val_turn_focus_total:.6e} "
                 f"select={val_selection_score:.6e} | "
-                f"train_output={train_motion:.6e} val_output={val_motion:.6e}"
+                f"train_output={train_motion:.6e} val_output={val_motion:.6e} | "
+                f"train_smooth={train_smoothness:.6e} val_smooth={val_smoothness:.6e}"
             )
             print(f"  val_disp_mse | {displacement_line}")
             print(f"  val_vel_mse  | {velocity_line}")
 
     if best_state_dict is not None:
-        load_unwrapped_state_dict(model, best_state_dict)
-        torch.save(
-            build_checkpoint_payload(best_state_dict, int(x_train.shape[1]), feature_context, loss_context, turning_focus_context),
-            MODEL_CHECKPOINT,
+        best_selection_checkpoint_path = checkpoint_dir / MODEL_CHECKPOINT.name
+        best_selection_payload = build_checkpoint_payload(
+            best_state_dict,
+            int(x_train.shape[1]),
+            feature_context,
+            loss_context,
+            turning_focus_context,
+            smoothness_config,
         )
+        load_unwrapped_state_dict(model, best_state_dict)
+        torch.save(best_selection_payload, best_selection_checkpoint_path)
+        checkpoint_paths["best_selection"] = best_selection_checkpoint_path
+        if export_compatibility_checkpoints and best_selection_checkpoint_path.resolve() != MODEL_CHECKPOINT.resolve():
+            torch.save(best_selection_payload, MODEL_CHECKPOINT)
+            checkpoint_paths["compatibility_best_selection"] = MODEL_CHECKPOINT
 
     if best_train_state_dict is not None:
-        torch.save(
-            build_checkpoint_payload(best_train_state_dict, int(x_train.shape[1]), feature_context, loss_context, turning_focus_context),
-            TRAIN_LOSS_MODEL_CHECKPOINT,
+        best_train_loss_checkpoint_path = checkpoint_dir / TRAIN_LOSS_MODEL_CHECKPOINT.name
+        best_train_loss_payload = build_checkpoint_payload(
+            best_train_state_dict,
+            int(x_train.shape[1]),
+            feature_context,
+            loss_context,
+            turning_focus_context,
+            smoothness_config,
         )
+        torch.save(best_train_loss_payload, best_train_loss_checkpoint_path)
+        checkpoint_paths["best_train_loss"] = best_train_loss_checkpoint_path
+        if (
+            export_compatibility_checkpoints
+            and best_train_loss_checkpoint_path.resolve() != TRAIN_LOSS_MODEL_CHECKPOINT.resolve()
+        ):
+            torch.save(best_train_loss_payload, TRAIN_LOSS_MODEL_CHECKPOINT)
+            checkpoint_paths["compatibility_best_train_loss"] = TRAIN_LOSS_MODEL_CHECKPOINT
 
-    return model, feature_context, loss_context, history
+    return model, feature_context, loss_context, history, checkpoint_paths
 
 
 @torch.no_grad()
@@ -646,7 +846,6 @@ def rollout_models_teacher_forcing(
     base_rollout[0] = real_rollout[0].astype(np.float32)
     corrected_rollout[0] = real_rollout[0].astype(np.float32)
 
-    mlp_output_clip = 3.0 * loss_context["output_scale"].detach().cpu().numpy().ravel().astype(np.float32)
     feature_context_tensors = build_feature_context_tensors(feature_context, device)
     error_model.eval()
 
@@ -660,7 +859,6 @@ def rollout_models_teacher_forcing(
         features = build_mlp_input_feature_tensor(current_state_tensor, control_tensor, mass_tensor, dt_tensor)
         features = normalize_feature_tensor(features, feature_context_tensors)
         predicted_mlp_output = error_model(features).cpu().numpy()[0].astype(np.float32)
-        predicted_mlp_output = np.clip(predicted_mlp_output, -mlp_output_clip, mlp_output_clip)
 
         base_next = base_next_tensor.cpu().numpy().astype(np.float32)
         corrected_error = derive_full_error_from_mlp_output_np(
@@ -694,8 +892,9 @@ def plot_training_history(history: dict[str, list[float]], output_dir: Path) -> 
 
     axes[1].plot(epochs, safe_log10(np.asarray(history["train_motion"])), label="Train output")
     axes[1].plot(epochs, safe_log10(np.asarray(history["val_motion"])), label="Val output")
-    axes[1].plot(epochs, np.asarray(history["pose_loss_weight"]), label="Pose weight")
-    axes[1].set_title("Motion Loss / Pose Weight")
+    axes[1].plot(epochs, safe_log10(np.asarray(history["train_smoothness"])), label="Train smoothness")
+    axes[1].plot(epochs, safe_log10(np.asarray(history["val_smoothness"])), label="Val smoothness")
+    axes[1].set_title("Motion / Smoothness Loss (log10)")
     axes[1].set_xlabel("Epoch")
     axes[1].grid(True, linestyle="--", alpha=0.35)
     axes[1].legend()
@@ -708,7 +907,9 @@ def plot_training_history(history: dict[str, list[float]], output_dir: Path) -> 
     axes[2].legend()
 
     axes[3].plot(epochs, np.asarray(history["learning_rate"]), label="Learning rate")
-    axes[3].set_title("Cosine-Annealed Learning Rate")
+    axes[3].plot(epochs, np.asarray(history["pose_loss_weight"]), label="Pose weight")
+    axes[3].plot(epochs, np.asarray(history["smoothness_weight"]), label="Smoothness weight")
+    axes[3].set_title("Learning Rate / Loss Weights")
     axes[3].set_xlabel("Epoch")
     axes[3].grid(True, linestyle="--", alpha=0.35)
     axes[3].legend()
@@ -724,7 +925,7 @@ def plot_trajectory(real_rollout: np.ndarray, base_rollout: np.ndarray, correcte
     axes[0].plot(real_rollout[:, 0], real_rollout[:, 1], label=REAL_DATA_LABEL, linewidth=1.8)
     axes[0].plot(base_rollout[:, 0], base_rollout[:, 1], label="Base", linewidth=1.5)
     axes[0].plot(corrected_rollout[:, 0], corrected_rollout[:, 1], label="Base + NN", linewidth=1.6)
-    axes[0].set_title("Tractor Trajectory")
+    axes[0].set_title("Tractor Rear-Axle Trajectory")
     axes[0].set_xlabel("X (m)")
     axes[0].set_ylabel("Y (m)")
     axes[0].axis("equal")
@@ -756,14 +957,14 @@ def plot_key_state_timeseries(
     fig, axes = plt.subplots(4, 2, figsize=(14, 12))
     axes = axes.ravel()
     series = [
-        ("Tractor Vx", real_rollout[:, 3], base_rollout[:, 3], corrected_rollout[:, 3], "m/s"),
-        ("Tractor Vy", real_rollout[:, 4], base_rollout[:, 4], corrected_rollout[:, 4], "m/s"),
+        ("Tractor Rear-Axle Vx", real_rollout[:, 3], base_rollout[:, 3], corrected_rollout[:, 3], "m/s"),
+        ("Tractor Rear-Axle Vy", real_rollout[:, 4], base_rollout[:, 4], corrected_rollout[:, 4], "m/s"),
         ("Tractor Yaw Rate", np.rad2deg(real_rollout[:, 5]), np.rad2deg(base_rollout[:, 5]), np.rad2deg(corrected_rollout[:, 5]), "deg/s"),
         ("Trailer Vx", real_rollout[:, 9], base_rollout[:, 9], corrected_rollout[:, 9], "m/s"),
         ("Trailer Vy", real_rollout[:, 10], base_rollout[:, 10], corrected_rollout[:, 10], "m/s"),
         ("Trailer Yaw Rate", np.rad2deg(real_rollout[:, 11]), np.rad2deg(base_rollout[:, 11]), np.rad2deg(corrected_rollout[:, 11]), "deg/s"),
         ("Articulation", compute_articulation_series(real_rollout), compute_articulation_series(base_rollout), compute_articulation_series(corrected_rollout), "deg"),
-        ("Tractor Yaw", np.rad2deg(wrap_angle_error_np(real_rollout[:, 2])), np.rad2deg(wrap_angle_error_np(base_rollout[:, 2])), np.rad2deg(wrap_angle_error_np(corrected_rollout[:, 2])), "deg"),
+        ("Tractor Rear-Axle Yaw", np.rad2deg(wrap_angle_error_np(real_rollout[:, 2])), np.rad2deg(wrap_angle_error_np(base_rollout[:, 2])), np.rad2deg(wrap_angle_error_np(corrected_rollout[:, 2])), "deg"),
     ]
 
     for axis, (title, real_values, base_values, corrected_values, unit) in zip(axes, series, strict=False):

@@ -13,6 +13,7 @@ RUNS_ROOT = CONTROLTEST_DIR / "carsim_runs"
 MODEL_CHECKPOINT = MODULE_DIR / "best_truck_trailer_error_model.pth"
 TRAIN_LOSS_MODEL_CHECKPOINT = MODULE_DIR / "best_truck_trailer_error_model_train_loss.pth"
 BASE_MODEL_OUTPUT_DIR = MODULE_DIR / "truck_trailer_base_model_outputs"
+TRACTOR_STATE_REFERENCE = "rear_axle_center"
 REAL_DATA_LABEL = "真实数据"
 
 STATE_NAMES = [
@@ -29,6 +30,10 @@ STATE_NAMES = [
     "vy_s",
     "r_s",
 ]
+# Current external tractor states `x_t, y_t, vx_t, vy_t` are interpreted at the
+# tractor rear-axle center. The nominal base model converts them to its
+# internal tractor reference point before evaluating the dynamics, then
+# converts the result back to rear-axle-center states.
 # The MLP never receives absolute x/y coordinates. Tractor pose is advanced by
 # velocity residuals; trailer pose is rebuilt from trailer-to-tractor relative
 # pose, which keeps the rollout translation-invariant.
@@ -98,32 +103,32 @@ STATE_LOSS_WEIGHTS = {
     "x_t": 1.0,
     "y_t": 1.0,
     "psi_t": 5.0,
-    "vx_t": 1.0,
-    "vy_t": 1.0,
-    "r_t": 5.0,
+    "vx_t": 5.0,
+    "vy_t": 2.0,
+    "r_t": 2.0,
     "x_s": 1.0,
     "y_s": 1.0,
     "psi_s": 5.0,
-    "vx_s": 1.0,
-    "vy_s": 1.0,
-    "r_s": 5.0,
+    "vx_s": 5.0,
+    "vy_s": 2.0,
+    "r_s": 2.0,
 }
 
 TRAIN_BATCH_SIZE = 4096
 TRAIN_NUM_WORKERS = 0
 TRAIN_EPOCHS = 4000
-LEARNING_RATE = 1.0e-3
+LEARNING_RATE = 3.0e-3
 # Cosine annealing gradually decays the learning rate from LEARNING_RATE to
 # MIN_LEARNING_RATE across the whole training run.
 MIN_LEARNING_RATE = 1.0e-5
 # Pose loss stays disabled for the first 5000 optimizer steps, then turns on.
-POSE_LOSS_WARMUP_STEPS = 5000
+POSE_LOSS_WARMUP_STEPS = 10000000
 GRADIENT_CLIP_NORM = 200.0
 # Turn-focused training first gates samples by steering-wheel angle, then uses
 # a multi-signal turning severity score to rank those gated samples.
-TURNING_FOCUS_STEER_THRESHOLD_DEG = 5.0
-TURNING_GATE_BASE_WEIGHT = 3.0
-TURNING_SCORE_COMPONENT_CLIP = 6.0
+TURNING_FOCUS_STEER_THRESHOLD_DEG = 1.0
+TURNING_GATE_BASE_WEIGHT = 1.0
+TURNING_SCORE_COMPONENT_CLIP = 10.0
 TURNING_SCORE_YAW_RATE_REF_DEGPS = 12.0
 TURNING_SCORE_LATERAL_SPEED_REF_MPS = 0.8
 TURNING_SCORE_ARTICULATION_REF_DEG = 3.0
@@ -132,15 +137,22 @@ TURNING_SCORE_LATERAL_SPEED_WEIGHT = 0.75
 TURNING_SCORE_ARTICULATION_WEIGHT = 0.5
 TURNING_FOCUS_START_QUANTILE = 0.70
 TURNING_FOCUS_FULL_QUANTILE = 0.95
-TURNING_SAMPLE_WEIGHT_MAX = 10.0
-TURNING_SAMPLER_POWER = 1.5
-TURNING_SELECTION_BLEND = 0.70
+TURNING_SAMPLE_WEIGHT_MAX = 5.0
+TURNING_SAMPLER_POWER = 3.0
+TURNING_SELECTION_BLEND = 0.30
+# Local smoothness regularization constrains the residual model so that small
+# tractor-state Vx / Vy / yaw-rate perturbations under the same control input
+# do not create disproportionately large next-state corrections.
+VXYR_SMOOTHNESS_WEIGHT = 1.0e-2
+VXYR_SMOOTHNESS_DELTA_VX_MPS = 0.05
+VXYR_SMOOTHNESS_DELTA_VY_MPS = 0.02
+VXYR_SMOOTHNESS_DELTA_R_DEGPS = 0.2
 MLP_TORCH_DTYPE = torch.float32
 MLP_NUMPY_DTYPE = np.float32
 MLP_USE_LAYER_NORM = True
 MLP_HIDDEN_DIM = 128
 MLP_HIDDEN_LAYERS = 3
-MLP_DROPOUT_P = 0.08
+MLP_DROPOUT_P = 0.0
 DEFAULT_TRAILER_MASS_KG = float(BASE_MODEL_PARAMS["m_s_base"])
 NO_TRAILER_MASS_THRESHOLD_KG = 1.0
 FORCE_NO_TRAILER_MODE = False

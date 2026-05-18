@@ -2,11 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-
 import matplotlib
 
 matplotlib.use("Agg")
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -571,6 +569,8 @@ def load_truck_trailer_data_as_segment(csv_path: Path) -> SegmentData:
     torque_rl = read_column_as_float(dataframe, TORQUE_RL_CANDIDATES, "torque_rl", csv_path)
     torque_rr = read_column_as_float(dataframe, TORQUE_RR_CANDIDATES, "torque_rr", csv_path)
 
+    # The input CSV is interpreted such that tractor x/y/vx/vy are measured at
+    # the tractor rear-axle center.
     tractor_x = read_column_as_float(dataframe, TRACTOR_X_CANDIDATES, "tractor_x", csv_path)
     tractor_y = read_column_as_float(dataframe, TRACTOR_Y_CANDIDATES, "tractor_y", csv_path)
     tractor_yaw_deg = read_column_as_float(dataframe, TRACTOR_YAW_DEG_CANDIDATES, "tractor_yaw_deg", csv_path)

@@ -38,6 +38,7 @@ class MLPErrorModel(nn.Module):
                     nn.Linear(layer_input_dim, self.hidden_dim),
                     self._build_norm(self.hidden_dim),
                     nn.Tanh(),
+                    #nn.LeakyReLU(negative_slope=0.02),
                     nn.Dropout(safe_dropout),
                 ]
             )

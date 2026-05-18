@@ -114,7 +114,7 @@ def plot_trajectory(output_dir: Path, states: np.ndarray) -> Path:
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
     axes[0].plot(states[:, 0], states[:, 1], label="Tractor", linewidth=2.0)
-    axes[0].set_title("Tractor Trajectory")
+    axes[0].set_title("Tractor Rear-Axle Trajectory")
     axes[0].set_xlabel("X (m)")
     axes[0].set_ylabel("Y (m)")
     axes[0].set_aspect("equal", adjustable="box")
@@ -140,13 +140,13 @@ def plot_state_timeseries(output_dir: Path, time: np.ndarray, states: np.ndarray
     axes = axes.ravel()
 
     series = [
-        ("Tractor Vx", states[:, 3], "m/s"),
-        ("Tractor Vy", states[:, 4], "m/s"),
+        ("Tractor Rear-Axle Vx", states[:, 3], "m/s"),
+        ("Tractor Rear-Axle Vy", states[:, 4], "m/s"),
         ("Tractor Yaw Rate", np.rad2deg(states[:, 5]), "deg/s"),
         ("Trailer Vx", states[:, 9], "m/s"),
         ("Trailer Vy", states[:, 10], "m/s"),
         ("Trailer Yaw Rate", np.rad2deg(states[:, 11]), "deg/s"),
-        ("Tractor Yaw", np.rad2deg(wrap_angle_error_np(states[:, 2])), "deg"),
+        ("Tractor Rear-Axle Yaw", np.rad2deg(wrap_angle_error_np(states[:, 2])), "deg"),
         ("Articulation", np.rad2deg(wrap_angle_error_np(states[:, 8] - states[:, 2])), "deg"),
     ]
 
