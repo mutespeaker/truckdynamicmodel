@@ -15,6 +15,7 @@ try:
     from .base_model import TruckTrailerNominalDynamics
     from .constants import (
         BASE_MODEL_PARAMS,
+        LR_COSINE_CYCLES,
         LEARNING_RATE,
         MIN_LEARNING_RATE,
         RUNS_ROOT,
@@ -48,6 +49,7 @@ except ImportError:
     from base_model import TruckTrailerNominalDynamics
     from constants import (
         BASE_MODEL_PARAMS,
+        LR_COSINE_CYCLES,
         LEARNING_RATE,
         MIN_LEARNING_RATE,
         RUNS_ROOT,
@@ -100,6 +102,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=MIN_LEARNING_RATE,
         help="Cosine annealing minimum learning rate.",
+    )
+    parser.add_argument(
+        "--lr-cosine-cycles",
+        type=int,
+        default=LR_COSINE_CYCLES,
+        help="Number of cosine learning-rate cycles across the whole training run.",
     )
     parser.add_argument("--batch-size", type=int, default=TRAIN_BATCH_SIZE, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=TRAIN_NUM_WORKERS, help="DataLoader workers.")
@@ -290,6 +298,7 @@ def main() -> None:
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         min_learning_rate=args.min_learning_rate,
+        lr_cosine_cycles=args.lr_cosine_cycles,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         checkpoint_dir=checkpoint_dir,
@@ -350,6 +359,7 @@ def main() -> None:
             "epochs": int(args.epochs),
             "learning_rate": float(args.learning_rate),
             "min_learning_rate": float(args.min_learning_rate),
+            "lr_cosine_cycles": int(args.lr_cosine_cycles),
             "batch_size": int(args.batch_size),
             "num_workers": int(args.num_workers),
             "vx_vy_r_smoothness_base_weight": float(args.vx_vy_r_smoothness_weight),

@@ -104,7 +104,7 @@ STATE_LOSS_WEIGHTS = {
     "y_t": 1.0,
     "psi_t": 1.0,
     "vx_t": 5.0,
-    "vy_t": 5.0,
+    "vy_t": 1.0,
     "r_t": 5.0,
     "x_s": 1.0,
     "y_s": 1.0,
@@ -118,11 +118,12 @@ TRAIN_BATCH_SIZE = 4096
 TRAIN_NUM_WORKERS = 0
 TRAIN_EPOCHS = 4000
 LEARNING_RATE = 3.0e-3
-# Cosine annealing gradually decays the learning rate from LEARNING_RATE to
-# MIN_LEARNING_RATE across the whole training run.
-MIN_LEARNING_RATE = 1.0e-5
+# Multi-cycle cosine annealing repeats the decay from LEARNING_RATE to
+# MIN_LEARNING_RATE several times across the whole training run.
+MIN_LEARNING_RATE = 1.0e-6
+LR_COSINE_CYCLES = 3
 # Pose loss stays disabled for the first 5000 optimizer steps, then turns on.
-POSE_LOSS_WARMUP_STEPS = 10000000
+POSE_LOSS_WARMUP_STEPS = 100000000
 GRADIENT_CLIP_NORM = 200.0
 # Turn-focused training first gates samples by steering-wheel angle, then uses
 # a multi-signal turning severity score to rank those gated samples.
@@ -143,7 +144,7 @@ TURNING_SELECTION_BLEND = 0.30
 # Local smoothness regularization constrains the residual model so that small
 # tractor-state Vx / Vy / yaw-rate perturbations under the same control input
 # do not create disproportionately large next-state corrections.
-VXYR_SMOOTHNESS_WEIGHT = 1.0e-2
+VXYR_SMOOTHNESS_WEIGHT = 1.0
 VXYR_SMOOTHNESS_ZERO_FRACTION = 0.25
 VXYR_SMOOTHNESS_BASE_FRACTION = 0.50
 VXYR_SMOOTHNESS_FINAL_MULTIPLIER = 10.0
@@ -154,8 +155,8 @@ MLP_TORCH_DTYPE = torch.float32
 MLP_NUMPY_DTYPE = np.float32
 MLP_USE_LAYER_NORM = True
 MLP_HIDDEN_DIM = 128
-MLP_HIDDEN_LAYERS = 3
-MLP_DROPOUT_P = 0.0
+MLP_HIDDEN_LAYERS = 4
+MLP_DROPOUT_P = 0.01
 DEFAULT_TRAILER_MASS_KG = float(BASE_MODEL_PARAMS["m_s_base"])
 NO_TRAILER_MASS_THRESHOLD_KG = 1.0
 FORCE_NO_TRAILER_MODE = False

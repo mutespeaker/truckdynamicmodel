@@ -18,6 +18,7 @@ try:
     from .constants import (
         CONTROL_NAMES,
         GRADIENT_CLIP_NORM,
+        LR_COSINE_CYCLES,
         LEARNING_RATE,
         MIN_LEARNING_RATE,
         MLP_CONTROL_FEATURE_NAMES,
@@ -78,6 +79,7 @@ except ImportError:
     from constants import (
         CONTROL_NAMES,
         GRADIENT_CLIP_NORM,
+        LR_COSINE_CYCLES,
         LEARNING_RATE,
         MIN_LEARNING_RATE,
         MLP_CONTROL_FEATURE_NAMES,
@@ -196,7 +198,7 @@ def compute_loss_components(
     full_residual = (predicted_error[:, full_indices] - true_error[:, full_indices]) / error_scale[:, full_indices]
     full_weight = channel_weight[:, full_indices]
     full_loss_per_sample = torch.mean((full_residual * full_weight).square(), dim=1)
-    total_loss_per_sample = output_loss_per_sample + pose_loss_weight * pose_loss_per_sample + 0.0* full_loss_per_sample
+    total_loss_per_sample = output_loss_per_sample + pose_loss_weight * pose_loss_per_sample + 0.2* full_loss_per_sample
 
     if sample_weight is not None:
         sample_weight = sample_weight.reshape(-1).to(device=predicted_mlp_output.device, dtype=MLP_TORCH_DTYPE)
@@ -485,6 +487,34 @@ def get_current_learning_rate(optimizer: torch.optim.Optimizer) -> float:
     return float(optimizer.param_groups[0]["lr"])
 
 
+def compute_multicycle_cosine_learning_rate(
+    step_index: int,
+    total_steps: int,
+    cycles: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+) -> float:
+    if cycles <= 0:
+        raise ValueError(f"cycles must be positive, got {cycles}.")
+    total_steps = max(1, int(total_steps))
+    if step_index >= total_steps:
+        return float(min_learning_rate)
+    if total_steps == 1:
+        return float(max_learning_rate)
+    clamped_step = max(0, int(step_index))
+    # The phase is based on absolute optimizer steps, so the whole training run
+    # contains exactly `cycles` cosine periods even when total_steps is not
+    # divisible by cycles.
+    phase = (float(clamped_step) * float(cycles) / float(total_steps)) % 1.0
+    cosine_scale = 0.5 * (1.0 + float(np.cos(np.pi * phase)))
+    return float(min_learning_rate + (max_learning_rate - min_learning_rate) * cosine_scale)
+
+
+def set_optimizer_learning_rate(optimizer: torch.optim.Optimizer, learning_rate: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(learning_rate)
+
+
 def train_error_model_multirun(
     base_model: TruckTrailerNominalDynamics,
     train_segments: list[SegmentData],
@@ -493,6 +523,7 @@ def train_error_model_multirun(
     epochs: int = TRAIN_EPOCHS,
     learning_rate: float = LEARNING_RATE,
     min_learning_rate: float = MIN_LEARNING_RATE,
+    lr_cosine_cycles: int = LR_COSINE_CYCLES,
     batch_size: int = TRAIN_BATCH_SIZE,
     num_workers: int = TRAIN_NUM_WORKERS,
     checkpoint_dir: Path | None = None,
@@ -507,6 +538,8 @@ def train_error_model_multirun(
         raise ValueError(
             f"min_learning_rate ({min_learning_rate}) must not be greater than learning_rate ({learning_rate})."
         )
+    if lr_cosine_cycles <= 0:
+        raise ValueError(f"lr_cosine_cycles must be positive, got {lr_cosine_cycles}.")
     if vx_vy_r_smoothness_weight < 0.0:
         raise ValueError(
             f"vx_vy_r_smoothness_weight must be non-negative, got {vx_vy_r_smoothness_weight}."
@@ -612,10 +645,15 @@ def train_error_model_multirun(
         drop_last=False,
     )
     scheduler_total_steps = max(1, int(epochs) * max(1, len(train_loader)))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    set_optimizer_learning_rate(
         optimizer,
-        T_max=scheduler_total_steps,
-        eta_min=float(min_learning_rate),
+        compute_multicycle_cosine_learning_rate(
+            step_index=0,
+            total_steps=scheduler_total_steps,
+            cycles=lr_cosine_cycles,
+            max_learning_rate=learning_rate,
+            min_learning_rate=min_learning_rate,
+        ),
     )
 
     history = {
@@ -701,8 +739,17 @@ def train_error_model_multirun(
             losses["total_loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
             optimizer.step()
-            scheduler.step()
             global_step += 1
+            set_optimizer_learning_rate(
+                optimizer,
+                compute_multicycle_cosine_learning_rate(
+                    step_index=global_step,
+                    total_steps=scheduler_total_steps,
+                    cycles=lr_cosine_cycles,
+                    max_learning_rate=learning_rate,
+                    min_learning_rate=min_learning_rate,
+                ),
+            )
 
             batch_size_value = x_batch.shape[0]
             train_total += float(losses["total_loss"].detach().cpu()) * batch_size_value

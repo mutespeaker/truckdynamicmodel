@@ -28,6 +28,7 @@ try:
         compute_rmse_summary,
         export_results_csv,
         extract_feature_context,
+        extract_output_clip,
         load_error_model,
         plot_state_error_all,
         rollout_recursive,
@@ -45,6 +46,7 @@ except ImportError:
         compute_rmse_summary,
         export_results_csv,
         extract_feature_context,
+        extract_output_clip,
         load_error_model,
         plot_state_error_all,
         rollout_recursive,
@@ -111,7 +113,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_output_dir(csv_path: Path) -> Path:
-    out_dir = csv_path.parent / f"{csv_path.stem}_recursive_10s_eval"
+    out_dir = csv_path.parent / f"{csv_path.stem}_10s_eval"
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
@@ -154,7 +156,7 @@ def build_window_segment(parent_seg: InferenceSegment, start_step: int, window_s
     end_step = start_step + window_steps
     start_time_s = float(parent_seg.time[start_step])
     start_time_from_segment_s = float(start_time_s - float(parent_seg.time[0]))
-    window_out_dir = parent_seg.out_dir / f"w{window_index:03d}_t{start_time_from_segment_s:07.2f}s"
+    window_out_dir = parent_seg.out_dir / f"w{window_index:03d}"
     window_out_dir.mkdir(parents=True, exist_ok=True)
 
     window_time = parent_seg.time[start_step : end_step + 1].copy().astype(np.float32)
@@ -293,6 +295,9 @@ def main() -> None:
 
     base_model = build_base_model(checkpoint_metadata, device)
     feature_context = extract_feature_context(checkpoint_metadata)
+    mlp_output_clip = extract_output_clip(checkpoint_metadata)
+    if mlp_output_clip is None:
+        print("No MLP output clipping will be applied.")
     feature_context_tensors = None
     if feature_context is not None:
         feature_context_tensors = build_feature_context_tensors(feature_context, device)
@@ -342,6 +347,7 @@ def main() -> None:
                 dt_values=window_seg.dt_values,
                 device=device,
                 feature_context_tensors=feature_context_tensors,
+                mlp_output_clip=mlp_output_clip,
             )
             results_csv = export_results_csv(window_seg, WINDOW_MODE_KEY, recursive_base, recursive_nn)
             error_png = plot_state_error_all(window_seg, WINDOW_MODE_KEY, recursive_base, recursive_nn)
