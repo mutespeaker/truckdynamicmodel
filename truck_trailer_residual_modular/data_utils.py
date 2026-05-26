@@ -416,7 +416,7 @@ def find_all_train_segment_csvs_under(root_dir: Path) -> list[Path]:
     if not root_dir.exists():
         raise FileNotFoundError(f"root_dir does not exist: {root_dir}")
     return sorted(
-        root_dir.rglob("*_train_segment_*.csv"),
+        root_dir.rglob("*_train*.csv"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -855,17 +855,17 @@ def build_loss_context(true_error: np.ndarray, true_mlp_output: np.ndarray, devi
     min_scale = np.array(
         [
             0.001,
+            0.0001,
+            np.deg2rad(0.001),
             0.001,
-            np.deg2rad(0.01),
+            0.0001,
+            np.deg2rad(0.001),
             0.001,
+            0.0001,
+            np.deg2rad(0.001),
             0.001,
-            np.deg2rad(0.01),
-            0.001,
-            0.001,
-            np.deg2rad(0.01),
-            0.001,
-            0.001,
-            np.deg2rad(0.01),
+            0.0001,
+            np.deg2rad(0.001),
         ],
         dtype=np.float32,
     )
@@ -877,20 +877,20 @@ def build_loss_context(true_error: np.ndarray, true_mlp_output: np.ndarray, devi
     output_min_scale = np.array(
         [
             0.001,
+            0.0001,
+            np.deg2rad(0.0001),
             0.001,
-            np.deg2rad(0.01),
+            0.0001,
+            np.deg2rad(0.0001),
             0.001,
             0.001,
-            np.deg2rad(0.01),
-            0.001,
-            0.001,
-            np.deg2rad(0.01),
+            np.deg2rad(0.001),
         ],
         dtype=np.float32,
     )
     output_scale = np.maximum(np.std(true_mlp_output, axis=0).astype(np.float32), output_min_scale).astype(np.float32)
     channel_weight = np.array([STATE_LOSS_WEIGHTS[name] for name in STATE_NAMES], dtype=np.float32)
-    output_weight = np.array([1.0, 1.0, 5.0, 1.0, 1.0, 5.0, 1.0, 1.0, 2.0], dtype=np.float32)
+    output_weight = np.array([5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 1.0, 1.0, 2.0], dtype=np.float32)
     return {
         "error_scale": to_mlp_tensor(error_scale.reshape(1, -1), device),
         "pose_error_scale": to_mlp_tensor(pose_error_scale.reshape(1, -1), device),

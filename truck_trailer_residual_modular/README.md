@@ -160,3 +160,11 @@ For the exact reproduction commands and output paths, see `EXPERIMENT_REPRODUCTI
 - If no compatible checkpoint exists yet, run `train_main.py` before `inference_main.py`.
 - The per-run inference output folder name is suffixed with `_modular` to avoid mixing results with the original scripts.
 - With `FORCE_NO_TRAILER_MODE = False`, trailer data is used when complete trailer columns are present; otherwise the loader mirrors tractor channels into the trailer placeholder channels, sets trailer mass to zero, and uses a fixed `0.02 s` step.
+
+## Learning Rate Schedule
+
+- Training now uses three-cycle cosine annealing by default.
+- The learning rate repeats the same cosine decay from `LEARNING_RATE` to `MIN_LEARNING_RATE` three times over the full optimizer-step budget.
+- The default cycle count is controlled by `LR_COSINE_CYCLES = 3` in `constants.py`.
+- The training command can override it with `--lr-cosine-cycles <N>`.
+- Compared with the previous one-cycle schedule, this periodically raises the learning rate again after each cosine valley, giving the optimizer three exploration/refinement phases in one training run.

@@ -18,6 +18,7 @@ try:
     from .constants import (
         CONTROL_NAMES,
         GRADIENT_CLIP_NORM,
+        LR_COSINE_CYCLES,
         LEARNING_RATE,
         MIN_LEARNING_RATE,
         MLP_CONTROL_FEATURE_NAMES,
@@ -46,6 +47,9 @@ try:
         VXYR_SMOOTHNESS_DELTA_R_DEGPS,
         VXYR_SMOOTHNESS_DELTA_VX_MPS,
         VXYR_SMOOTHNESS_DELTA_VY_MPS,
+        VXYR_SMOOTHNESS_BASE_FRACTION,
+        VXYR_SMOOTHNESS_FINAL_MULTIPLIER,
+        VXYR_SMOOTHNESS_ZERO_FRACTION,
         VXYR_SMOOTHNESS_WEIGHT,
     )
     from .data_utils import (
@@ -75,6 +79,7 @@ except ImportError:
     from constants import (
         CONTROL_NAMES,
         GRADIENT_CLIP_NORM,
+        LR_COSINE_CYCLES,
         LEARNING_RATE,
         MIN_LEARNING_RATE,
         MLP_CONTROL_FEATURE_NAMES,
@@ -103,6 +108,9 @@ except ImportError:
         VXYR_SMOOTHNESS_DELTA_R_DEGPS,
         VXYR_SMOOTHNESS_DELTA_VX_MPS,
         VXYR_SMOOTHNESS_DELTA_VY_MPS,
+        VXYR_SMOOTHNESS_BASE_FRACTION,
+        VXYR_SMOOTHNESS_FINAL_MULTIPLIER,
+        VXYR_SMOOTHNESS_ZERO_FRACTION,
         VXYR_SMOOTHNESS_WEIGHT,
     )
     from data_utils import (
@@ -140,7 +148,7 @@ VALIDATION_DIRECTION_CHANNELS = (
     ("vy_s", STATE_NAMES.index("vy_s")),
 )
 VXYR_SMOOTHNESS_FEATURE_NAMES = ("vx_t", "vy_t", "r_t")
-VXYR_SMOOTHNESS_STATE_NAMES = tuple(STATE_NAMES)
+VXYR_SMOOTHNESS_STATE_NAMES = tuple(MOTION_STATE_NAMES)
 
 
 def compute_loss_components(
@@ -190,7 +198,7 @@ def compute_loss_components(
     full_residual = (predicted_error[:, full_indices] - true_error[:, full_indices]) / error_scale[:, full_indices]
     full_weight = channel_weight[:, full_indices]
     full_loss_per_sample = torch.mean((full_residual * full_weight).square(), dim=1)
-    total_loss_per_sample = output_loss_per_sample + pose_loss_weight * pose_loss_per_sample + 0.05 * full_loss_per_sample
+    total_loss_per_sample = output_loss_per_sample + pose_loss_weight * pose_loss_per_sample + 0.2* full_loss_per_sample
 
     if sample_weight is not None:
         sample_weight = sample_weight.reshape(-1).to(device=predicted_mlp_output.device, dtype=MLP_TORCH_DTYPE)
@@ -255,7 +263,11 @@ def build_checkpoint_payload(
         }
     if vx_vy_r_smoothness_config is not None:
         payload["vx_vy_r_smoothness"] = {
-            "weight": float(vx_vy_r_smoothness_config["weight"]),
+            "weight": float(vx_vy_r_smoothness_config["base_weight"]),
+            "base_weight": float(vx_vy_r_smoothness_config["base_weight"]),
+            "zero_fraction": float(vx_vy_r_smoothness_config["zero_fraction"]),
+            "base_fraction": float(vx_vy_r_smoothness_config["base_fraction"]),
+            "final_multiplier": float(vx_vy_r_smoothness_config["final_multiplier"]),
             "feature_names": list(vx_vy_r_smoothness_config["feature_names"]),
             "state_names": list(vx_vy_r_smoothness_config["state_names"]),
             "delta_vx_mps": float(vx_vy_r_smoothness_config["delta_vx_mps"]),
@@ -328,6 +340,18 @@ def compute_pose_loss_weight(global_step: int) -> float:
     return 1.0
 
 
+def compute_vx_vy_r_smoothness_weight(global_step: int, total_steps: int, base_weight: float) -> float:
+    if base_weight <= 0.0:
+        return 0.0
+    progress = float(global_step) / float(max(1, total_steps))
+    progress = min(max(progress, 0.0), 1.0)
+    if progress < VXYR_SMOOTHNESS_ZERO_FRACTION:
+        return 0.0
+    if progress < VXYR_SMOOTHNESS_BASE_FRACTION:
+        return float(base_weight)
+    return float(base_weight) * float(VXYR_SMOOTHNESS_FINAL_MULTIPLIER)
+
+
 def reduce_per_sample_loss(loss_per_sample: torch.Tensor, sample_weight: torch.Tensor | None = None) -> torch.Tensor:
     if sample_weight is not None:
         sample_weight = sample_weight.reshape(-1).to(device=loss_per_sample.device, dtype=MLP_TORCH_DTYPE)
@@ -363,6 +387,10 @@ def build_vx_vy_r_smoothness_config(
     regularized_state_indices = [STATE_NAMES.index(name) for name in VXYR_SMOOTHNESS_STATE_NAMES]
     return {
         "weight": float(weight),
+        "base_weight": float(weight),
+        "zero_fraction": float(VXYR_SMOOTHNESS_ZERO_FRACTION),
+        "base_fraction": float(VXYR_SMOOTHNESS_BASE_FRACTION),
+        "final_multiplier": float(VXYR_SMOOTHNESS_FINAL_MULTIPLIER),
         "feature_names": list(VXYR_SMOOTHNESS_FEATURE_NAMES),
         "state_names": list(VXYR_SMOOTHNESS_STATE_NAMES),
         "delta_vx_mps": float(VXYR_SMOOTHNESS_DELTA_VX_MPS),
@@ -459,6 +487,34 @@ def get_current_learning_rate(optimizer: torch.optim.Optimizer) -> float:
     return float(optimizer.param_groups[0]["lr"])
 
 
+def compute_multicycle_cosine_learning_rate(
+    step_index: int,
+    total_steps: int,
+    cycles: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+) -> float:
+    if cycles <= 0:
+        raise ValueError(f"cycles must be positive, got {cycles}.")
+    total_steps = max(1, int(total_steps))
+    if step_index >= total_steps:
+        return float(min_learning_rate)
+    if total_steps == 1:
+        return float(max_learning_rate)
+    clamped_step = max(0, int(step_index))
+    # The phase is based on absolute optimizer steps, so the whole training run
+    # contains exactly `cycles` cosine periods even when total_steps is not
+    # divisible by cycles.
+    phase = (float(clamped_step) * float(cycles) / float(total_steps)) % 1.0
+    cosine_scale = 0.5 * (1.0 + float(np.cos(np.pi * phase)))
+    return float(min_learning_rate + (max_learning_rate - min_learning_rate) * cosine_scale)
+
+
+def set_optimizer_learning_rate(optimizer: torch.optim.Optimizer, learning_rate: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(learning_rate)
+
+
 def train_error_model_multirun(
     base_model: TruckTrailerNominalDynamics,
     train_segments: list[SegmentData],
@@ -467,6 +523,7 @@ def train_error_model_multirun(
     epochs: int = TRAIN_EPOCHS,
     learning_rate: float = LEARNING_RATE,
     min_learning_rate: float = MIN_LEARNING_RATE,
+    lr_cosine_cycles: int = LR_COSINE_CYCLES,
     batch_size: int = TRAIN_BATCH_SIZE,
     num_workers: int = TRAIN_NUM_WORKERS,
     checkpoint_dir: Path | None = None,
@@ -481,6 +538,8 @@ def train_error_model_multirun(
         raise ValueError(
             f"min_learning_rate ({min_learning_rate}) must not be greater than learning_rate ({learning_rate})."
         )
+    if lr_cosine_cycles <= 0:
+        raise ValueError(f"lr_cosine_cycles must be positive, got {lr_cosine_cycles}.")
     if vx_vy_r_smoothness_weight < 0.0:
         raise ValueError(
             f"vx_vy_r_smoothness_weight must be non-negative, got {vx_vy_r_smoothness_weight}."
@@ -586,10 +645,15 @@ def train_error_model_multirun(
         drop_last=False,
     )
     scheduler_total_steps = max(1, int(epochs) * max(1, len(train_loader)))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    set_optimizer_learning_rate(
         optimizer,
-        T_max=scheduler_total_steps,
-        eta_min=float(min_learning_rate),
+        compute_multicycle_cosine_learning_rate(
+            step_index=0,
+            total_steps=scheduler_total_steps,
+            cycles=lr_cosine_cycles,
+            max_learning_rate=learning_rate,
+            min_learning_rate=min_learning_rate,
+        ),
     )
 
     history = {
@@ -623,6 +687,7 @@ def train_error_model_multirun(
         train_pose = 0.0
         train_motion = 0.0
         train_smoothness = 0.0
+        train_smoothness_weight_sum = 0.0
         train_count = 0
         pose_loss_weight = compute_pose_loss_weight(global_step)
         epoch_learning_rate = get_current_learning_rate(optimizer)
@@ -636,6 +701,11 @@ def train_error_model_multirun(
             mass_batch = mass_batch_cpu.to(device, non_blocking=pin_memory)
             sample_weight_batch = sample_weight_batch_cpu.to(device, non_blocking=pin_memory)
             pose_loss_weight = compute_pose_loss_weight(global_step)
+            current_smoothness_weight = compute_vx_vy_r_smoothness_weight(
+                global_step,
+                scheduler_total_steps,
+                vx_vy_r_smoothness_weight,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             predicted_mlp_output = model(x_batch)
@@ -657,10 +727,10 @@ def train_error_model_multirun(
                 dt_values=dt_batch,
                 trailer_mass_kg=mass_batch,
                 loss_context=loss_context,
-                smoothness_config=smoothness_config,
+                smoothness_config=smoothness_config if current_smoothness_weight > 0.0 else None,
                 sample_weight=sample_weight_batch,
             )
-            total_loss_per_sample = losses["total_loss_per_sample"] + float(vx_vy_r_smoothness_weight) * smoothness_losses["loss_per_sample"]
+            total_loss_per_sample = losses["total_loss_per_sample"] + current_smoothness_weight * smoothness_losses["loss_per_sample"]
             losses["supervised_total_loss"] = losses["total_loss"]
             losses["smoothness_loss"] = smoothness_losses["loss"]
             losses["total_loss_per_sample"] = total_loss_per_sample
@@ -669,18 +739,33 @@ def train_error_model_multirun(
             losses["total_loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
             optimizer.step()
-            scheduler.step()
             global_step += 1
+            set_optimizer_learning_rate(
+                optimizer,
+                compute_multicycle_cosine_learning_rate(
+                    step_index=global_step,
+                    total_steps=scheduler_total_steps,
+                    cycles=lr_cosine_cycles,
+                    max_learning_rate=learning_rate,
+                    min_learning_rate=min_learning_rate,
+                ),
+            )
 
             batch_size_value = x_batch.shape[0]
             train_total += float(losses["total_loss"].detach().cpu()) * batch_size_value
             train_pose += float(losses["pose_loss"].detach().cpu()) * batch_size_value
             train_motion += float(losses["motion_loss"].detach().cpu()) * batch_size_value
             train_smoothness += float(losses["smoothness_loss"].detach().cpu()) * batch_size_value
+            train_smoothness_weight_sum += float(current_smoothness_weight) * batch_size_value
             train_count += batch_size_value
 
         model.eval()
         val_pose_loss_weight = compute_pose_loss_weight(global_step)
+        val_smoothness_weight = compute_vx_vy_r_smoothness_weight(
+            global_step,
+            scheduler_total_steps,
+            vx_vy_r_smoothness_weight,
+        )
         val_total = 0.0
         val_pose = 0.0
         val_motion = 0.0
@@ -717,10 +802,10 @@ def train_error_model_multirun(
                     dt_values=dt_batch,
                     trailer_mass_kg=mass_batch,
                     loss_context=loss_context,
-                    smoothness_config=smoothness_config,
+                    smoothness_config=smoothness_config if val_smoothness_weight > 0.0 else None,
                     sample_weight=None,
                 )
-                total_loss_per_sample = losses["total_loss_per_sample"] + float(vx_vy_r_smoothness_weight) * smoothness_losses["loss_per_sample"]
+                total_loss_per_sample = losses["total_loss_per_sample"] + val_smoothness_weight * smoothness_losses["loss_per_sample"]
                 losses["supervised_total_loss"] = losses["total_loss"]
                 losses["smoothness_loss"] = smoothness_losses["loss"]
                 losses["total_loss_per_sample"] = total_loss_per_sample
@@ -743,6 +828,7 @@ def train_error_model_multirun(
         train_pose /= max(train_count, 1)
         train_motion /= max(train_count, 1)
         train_smoothness /= max(train_count, 1)
+        epoch_smoothness_weight = train_smoothness_weight_sum / max(train_count, 1)
         val_total /= max(val_count, 1)
         val_pose /= max(val_count, 1)
         val_motion /= max(val_count, 1)
@@ -763,7 +849,7 @@ def train_error_model_multirun(
         history["train_smoothness"].append(train_smoothness)
         history["val_smoothness"].append(val_smoothness)
         history["pose_loss_weight"].append(val_pose_loss_weight)
-        history["smoothness_weight"].append(float(vx_vy_r_smoothness_weight))
+        history["smoothness_weight"].append(epoch_smoothness_weight)
         history["val_turn_focus_total"].append(val_turn_focus_total)
         history["val_selection_score"].append(val_selection_score)
         history["learning_rate"].append(epoch_learning_rate)
@@ -781,7 +867,7 @@ def train_error_model_multirun(
             displacement_line, velocity_line = format_validation_mse_lines(validation_mse)
             print(
                 f"Epoch {epoch:5d}/{epochs} | step={global_step:6d} | lr={epoch_learning_rate:.6e} | "
-                f"pose_w={val_pose_loss_weight:.3f} smooth_w={float(vx_vy_r_smoothness_weight):.3e} | "
+                f"pose_w={val_pose_loss_weight:.3f} smooth_w={epoch_smoothness_weight:.3e} val_smooth_w={val_smoothness_weight:.3e} | "
                 f"train_total={train_total:.6e} val_total={val_total:.6e} val_turn={val_turn_focus_total:.6e} "
                 f"select={val_selection_score:.6e} | "
                 f"train_output={train_motion:.6e} val_output={val_motion:.6e} | "
@@ -846,6 +932,7 @@ def rollout_models_teacher_forcing(
     base_rollout[0] = real_rollout[0].astype(np.float32)
     corrected_rollout[0] = real_rollout[0].astype(np.float32)
 
+    mlp_output_clip = 3.0 * loss_context["output_scale"].detach().cpu().numpy().ravel().astype(np.float32)
     feature_context_tensors = build_feature_context_tensors(feature_context, device)
     error_model.eval()
 
@@ -859,6 +946,7 @@ def rollout_models_teacher_forcing(
         features = build_mlp_input_feature_tensor(current_state_tensor, control_tensor, mass_tensor, dt_tensor)
         features = normalize_feature_tensor(features, feature_context_tensors)
         predicted_mlp_output = error_model(features).cpu().numpy()[0].astype(np.float32)
+        predicted_mlp_output = np.clip(predicted_mlp_output, -mlp_output_clip, mlp_output_clip)
 
         base_next = base_next_tensor.cpu().numpy().astype(np.float32)
         corrected_error = derive_full_error_from_mlp_output_np(

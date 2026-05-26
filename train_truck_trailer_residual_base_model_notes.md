@@ -1,6 +1,6 @@
-# `train_truck_trailer_residual.py` 中 Base Model 说明
+Base Model 说明
 
-本文档整理 [train_truck_trailer_residual.py](d:/test_torch%20project/controltest/train_truck_trailer_residual.py) 里 `TruckTrailerNominalDynamics` 的建模思路、物理量含义、主要公式，以及当前模型中不够合理的地方和改进建议。
+本文档整理 `TruckTrailerNominalDynamics` 的建模思路、物理量含义、主要公式，以及当前模型中不够合理的地方和改进建议。
 
 ## 1. 这个 Base Model 是干什么的
 
@@ -47,14 +47,14 @@
 控制量定义为 5 维：
 
 ```text
-[delta_f_rad, torque_fl, torque_fr, torque_rl, torque_rr]
+[steer_sw_rad, torque_fl, torque_fr, torque_rl, torque_rr]
 ```
 
 含义如下：
 
 | 符号 | 含义 | 单位 |
 | --- | --- | --- |
-| `delta_f_rad` | 前轮转角 | rad |
+| `steer_sw_rad` | 方向盘转角 | rad |
 | `torque_fl` | 左前轮扭矩 | Nm |
 | `torque_fr` | 右前轮扭矩 | Nm |
 | `torque_rl` | 左后轮扭矩 | Nm |
@@ -110,7 +110,7 @@
 | `Cs` | 挂车轴侧偏刚度 | `80000 N/rad` |
 | `wheel_radius` | 车轮半径 | `0.5 m` |
 | `track_width` | 轮距 | `1.8 m` |
-| `steering_ratio` | 方向盘角换算到前轮转角的传动比，仅用于原始数据预处理 | `16.39` |
+| `steering_ratio` | 方向盘角到前轮转角的传动比 | `24.0` |
 | `rho` | 空气密度 | `1.225 kg/m³` |
 | `CdA_t` | 牵引车阻力系数与迎风面积乘积 | `5.82` |
 | `CdA_s` | 挂车阻力系数与迎风面积乘积 | `6.50` |
@@ -148,9 +148,9 @@
 
 这就是一个“平面车体 + 简化轮胎 + 简化铰接”的名义模型。
 
-## 4.2 第二步：统一成前轮转角输入
+## 4.2 第二步：把方向盘角换成前轮转角
 
-如果原始数据给的是方向盘角，预处理里先做：
+模型内部先做：
 
 ```math
 \delta_f = \frac{\delta_{sw}}{i_s}
@@ -158,8 +158,8 @@
 
 其中：
 
-- `\delta_f` 是最终送进 base model 的前轮转角输入
-- `\delta_{sw}` 是原始方向盘转角
+- `\delta_f` 是前轮转角
+- `\delta_{sw}` 是方向盘转角输入
 - `i_s` 是转向传动比 `steering_ratio`
 
 对应代码在 [train_truck_trailer_residual.py](d:/test_torch%20project/controltest/train_truck_trailer_residual.py#L236)。

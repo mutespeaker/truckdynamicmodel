@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_output_dir(csv_path: Path) -> Path:
-    out_dir = csv_path.parent / f"{csv_path.stem}_recursive_velocity_trace_eval"
+    out_dir = csv_path.parent / f"{csv_path.stem}_vel_trace_eval"
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
@@ -341,6 +341,7 @@ def build_results_dataframe(seg: InferenceSegment, trace: RecursiveVelocityTrace
 
 def export_results_csv(seg: InferenceSegment, trace: RecursiveVelocityTrace) -> Path:
     output_path = seg.out_dir / "recursive_velocity_trace_results.csv"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     build_results_dataframe(seg, trace).to_csv(output_path, index=False, encoding="utf-8-sig")
     return output_path
 
@@ -372,7 +373,7 @@ def plot_recursive_velocity_comparison(seg: InferenceSegment, trace: RecursiveVe
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.02))
 
-    output_path = seg.out_dir / "recursive_velocity_comparison.png"
+    output_path = seg.out_dir / "vel_compare.png"
     save_trace_figure(fig, output_path, top_margin=0.93)
     return output_path
 
@@ -404,7 +405,7 @@ def plot_nn_branch_velocity_components(seg: InferenceSegment, trace: RecursiveVe
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.02))
 
-    output_path = seg.out_dir / "recursive_nn_branch_velocity_components.png"
+    output_path = seg.out_dir / "nn_branch_vel.png"
     save_trace_figure(fig, output_path, top_margin=0.93)
     return output_path
 
@@ -434,7 +435,7 @@ def plot_mlp_motion_outputs(seg: InferenceSegment, trace: RecursiveVelocityTrace
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.02))
 
-    output_path = seg.out_dir / "recursive_mlp_motion_outputs.png"
+    output_path = seg.out_dir / "mlp_motion.png"
     save_trace_figure(fig, output_path, top_margin=0.93)
     return output_path
 

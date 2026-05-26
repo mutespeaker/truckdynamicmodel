@@ -254,11 +254,10 @@ def extract_feature_context(metadata: dict[str, object]) -> dict[str, np.ndarray
 
 
 def extract_output_clip(metadata: dict[str, object]) -> np.ndarray | None:
-    # Keep the saved output-scale metadata for analysis, but do not apply any
-    # hard clipping during rollout. This removes the inference-time safety
-    # boundary without changing the trained network weights or normalization.
-    _ = metadata
-    return None
+    output_scale = metadata.get("loss_output_scale")
+    if output_scale is None:
+        return None
+    return 3.0 * np.asarray(output_scale, dtype=MLP_NUMPY_DTYPE).reshape(-1)
 
 
 def extract_input_feature_names(metadata: dict[str, object], input_dim: int) -> list[str]:
@@ -377,6 +376,7 @@ def predict_base_and_nn_next_from_state(
     dt_value: float,
     device: torch.device,
     feature_context_tensors: dict[str, torch.Tensor] | None,
+    mlp_output_clip: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     dt = np.array([[dt_value]], dtype=np.float32)
     control = control_step.reshape(1, -1).astype(np.float32)
@@ -396,6 +396,8 @@ def predict_base_and_nn_next_from_state(
     if feature_context_tensors is not None:
         features = normalize_feature_tensor(features, feature_context_tensors)
     predicted_mlp_output = error_model(features).cpu().numpy()[0].astype(np.float32)
+    if mlp_output_clip is not None:
+        predicted_mlp_output = np.clip(predicted_mlp_output, -mlp_output_clip, mlp_output_clip)
     corrected_error = derive_full_error_from_mlp_output_np(
         predicted_mlp_output.reshape(1, -1),
         base_next,
@@ -420,6 +422,7 @@ def rollout_single_step(
     dt_values: np.ndarray,
     device: torch.device,
     feature_context_tensors: dict[str, torch.Tensor] | None,
+    mlp_output_clip: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     step_count = len(control_sequence) + 1
     base_rollout = np.zeros((step_count, len(STATE_NAMES)), dtype=np.float32)
@@ -437,6 +440,7 @@ def rollout_single_step(
             dt_value=float(dt_values[step]),
             device=device,
             feature_context_tensors=feature_context_tensors,
+            mlp_output_clip=mlp_output_clip,
         )
         base_rollout[step + 1] = base_next
         nn_rollout[step + 1] = nn_next
@@ -453,6 +457,7 @@ def rollout_recursive(
     dt_values: np.ndarray,
     device: torch.device,
     feature_context_tensors: dict[str, torch.Tensor] | None,
+    mlp_output_clip: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     step_count = len(control_sequence) + 1
     base_rollout = np.zeros((step_count, len(STATE_NAMES)), dtype=np.float32)
@@ -470,6 +475,7 @@ def rollout_recursive(
             dt_value=float(dt_values[step]),
             device=device,
             feature_context_tensors=feature_context_tensors,
+            mlp_output_clip=mlp_output_clip,
         )
         _, nn_next = predict_base_and_nn_next_from_state(
             base_model=base_model,
@@ -480,6 +486,7 @@ def rollout_recursive(
             dt_value=float(dt_values[step]),
             device=device,
             feature_context_tensors=feature_context_tensors,
+            mlp_output_clip=mlp_output_clip,
         )
         base_rollout[step + 1] = base_next
         nn_rollout[step + 1] = nn_next
@@ -718,7 +725,7 @@ def main() -> None:
     if feature_context is None:
         print("Checkpoint does not contain feature normalization statistics; raw features will be used.")
     if mlp_output_clip is None:
-        print("Residual clipping is disabled; saved output scaling remains available in the checkpoint for analysis only.")
+        print("Checkpoint does not contain output scaling; residual clipping is disabled.")
 
     summary_rows: list[dict[str, float]] = []
     processed_count = 0
@@ -739,6 +746,7 @@ def main() -> None:
             dt_values=seg.dt_values,
             device=device,
             feature_context_tensors=feature_context_tensors,
+            mlp_output_clip=mlp_output_clip,
         )
         recursive_base, recursive_nn = rollout_recursive(
             base_model=base_model,
@@ -749,6 +757,7 @@ def main() -> None:
             dt_values=seg.dt_values,
             device=device,
             feature_context_tensors=feature_context_tensors,
+            mlp_output_clip=mlp_output_clip,
         )
 
         controls_png = plot_controls(seg)

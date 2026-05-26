@@ -15,16 +15,20 @@ try:
     from .base_model import TruckTrailerNominalDynamics
     from .constants import (
         BASE_MODEL_PARAMS,
+        LR_COSINE_CYCLES,
         LEARNING_RATE,
         MIN_LEARNING_RATE,
         RUNS_ROOT,
         TRAIN_BATCH_SIZE,
         TRAIN_EPOCHS,
         TRAIN_NUM_WORKERS,
+        VXYR_SMOOTHNESS_BASE_FRACTION,
         VXYR_SMOOTHNESS_DELTA_R_DEGPS,
         VXYR_SMOOTHNESS_DELTA_VX_MPS,
         VXYR_SMOOTHNESS_DELTA_VY_MPS,
+        VXYR_SMOOTHNESS_FINAL_MULTIPLIER,
         VXYR_SMOOTHNESS_WEIGHT,
+        VXYR_SMOOTHNESS_ZERO_FRACTION,
     )
     from .data_utils import (
         SegmentData,
@@ -45,16 +49,20 @@ except ImportError:
     from base_model import TruckTrailerNominalDynamics
     from constants import (
         BASE_MODEL_PARAMS,
+        LR_COSINE_CYCLES,
         LEARNING_RATE,
         MIN_LEARNING_RATE,
         RUNS_ROOT,
         TRAIN_BATCH_SIZE,
         TRAIN_EPOCHS,
         TRAIN_NUM_WORKERS,
+        VXYR_SMOOTHNESS_BASE_FRACTION,
         VXYR_SMOOTHNESS_DELTA_R_DEGPS,
         VXYR_SMOOTHNESS_DELTA_VX_MPS,
         VXYR_SMOOTHNESS_DELTA_VY_MPS,
+        VXYR_SMOOTHNESS_FINAL_MULTIPLIER,
         VXYR_SMOOTHNESS_WEIGHT,
+        VXYR_SMOOTHNESS_ZERO_FRACTION,
     )
     from data_utils import (
         SegmentData,
@@ -95,13 +103,23 @@ def parse_args() -> argparse.Namespace:
         default=MIN_LEARNING_RATE,
         help="Cosine annealing minimum learning rate.",
     )
+    parser.add_argument(
+        "--lr-cosine-cycles",
+        type=int,
+        default=LR_COSINE_CYCLES,
+        help="Number of cosine learning-rate cycles across the whole training run.",
+    )
     parser.add_argument("--batch-size", type=int, default=TRAIN_BATCH_SIZE, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=TRAIN_NUM_WORKERS, help="DataLoader workers.")
     parser.add_argument(
         "--vx-vy-r-smoothness-weight",
         type=float,
         default=VXYR_SMOOTHNESS_WEIGHT,
-        help="Local smoothness regularization weight for small tractor Vx/Vy/yaw-rate perturbations under the same control input.",
+        help=(
+            "Base local smoothness regularization weight. Training uses a staged schedule: "
+            "0 for the first 25 percent of optimizer steps, this value for the next 25 percent, "
+            "and 10x this value for the final 50 percent. Set 0 to disable."
+        ),
     )
     parser.add_argument(
         "--summary-dir",
@@ -128,8 +146,12 @@ def compact_name(value: str, max_length: int = 48) -> str:
     sanitized = sanitize_name(value)
     if len(sanitized) <= max_length:
         return sanitized
-    digest = hashlib.sha1(sanitized.encode("utf-8")).hexdigest()[:8]
-    head_length = max(8, max_length - len(digest) - 1)
+    if max_length <= 0:
+        return ""
+    if max_length <= 8:
+        return hashlib.sha1(sanitized.encode("utf-8")).hexdigest()[:max_length]
+    digest = hashlib.sha1(sanitized.encode("utf-8")).hexdigest()[: min(6, max_length - 2)]
+    head_length = max_length - len(digest) - 1
     return f"{sanitized[:head_length]}_{digest}"
 
 
@@ -176,8 +198,10 @@ def build_validation_dir_token(seg: SegmentData) -> str:
     match = re.match(r"(?P<stamp>\d{8}_\d{6})\.(?P<frac>\d{5})_interpolated_train_segment_(?P<seg>\d+)$", stem)
     if match is not None:
         seg_index = int(match.group("seg"))
-        return f"{match.group('stamp')}_{match.group('frac')}_s{seg_index:03d}"
-    return compact_name(stem, max_length=24)
+        stamp_token = match.group("stamp").replace("_", "")[2:]
+        frac_token = match.group("frac")[:2]
+        return f"{stamp_token}_s{seg_index:03d}_{frac_token}"
+    return compact_name(stem, max_length=20)
 
 
 def build_validation_plot_dir(run_dir: Path, seg: SegmentData, index: int) -> Path:
@@ -186,7 +210,9 @@ def build_validation_plot_dir(run_dir: Path, seg: SegmentData, index: int) -> Pa
         max_length=12,
     )
     csv_token = build_validation_dir_token(seg)
-    out_dir = run_dir / "val_rollouts" / f"{index:03d}_{scenario_token}_{csv_token}"
+    # Keep validation leaf directories short enough for Windows/PIL save paths.
+    dir_name = compact_name(f"{index:03d}_{scenario_token}_{csv_token}", max_length=40)
+    out_dir = run_dir / "val_rollouts" / dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
@@ -272,6 +298,7 @@ def main() -> None:
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         min_learning_rate=args.min_learning_rate,
+        lr_cosine_cycles=args.lr_cosine_cycles,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         checkpoint_dir=checkpoint_dir,
@@ -332,9 +359,14 @@ def main() -> None:
             "epochs": int(args.epochs),
             "learning_rate": float(args.learning_rate),
             "min_learning_rate": float(args.min_learning_rate),
+            "lr_cosine_cycles": int(args.lr_cosine_cycles),
             "batch_size": int(args.batch_size),
             "num_workers": int(args.num_workers),
-            "vx_vy_r_smoothness_weight": float(args.vx_vy_r_smoothness_weight),
+            "vx_vy_r_smoothness_base_weight": float(args.vx_vy_r_smoothness_weight),
+            "vx_vy_r_smoothness_zero_fraction": float(VXYR_SMOOTHNESS_ZERO_FRACTION),
+            "vx_vy_r_smoothness_base_fraction": float(VXYR_SMOOTHNESS_BASE_FRACTION),
+            "vx_vy_r_smoothness_final_multiplier": float(VXYR_SMOOTHNESS_FINAL_MULTIPLIER),
+            "vx_vy_r_smoothness_regularized_states": ["vx_t", "vy_t", "r_t", "vx_s", "vy_s", "r_s"],
             "vx_vy_r_smoothness_delta_vx_mps": float(VXYR_SMOOTHNESS_DELTA_VX_MPS),
             "vx_vy_r_smoothness_delta_vy_mps": float(VXYR_SMOOTHNESS_DELTA_VY_MPS),
             "vx_vy_r_smoothness_delta_r_degps": float(VXYR_SMOOTHNESS_DELTA_R_DEGPS),
